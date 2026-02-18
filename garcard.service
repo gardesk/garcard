@@ -1,0 +1,14 @@
+[Unit]
+Description=garcard polkit auth agent
+Documentation=https://github.com/gardesk/gardesk
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=garcard daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
