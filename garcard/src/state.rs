@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// Typed phases for auth flow transitions.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthPhase {
     Idle,
@@ -28,21 +29,6 @@ impl AuthPhase {
             Self::Failure => "failure",
             Self::Canceled => "canceled",
             Self::Timeout => "timeout",
-        }
-    }
-
-    pub fn from_label(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "idle" => Some(Self::Idle),
-            "pending" | "pending_prompt" | "pending-prompt" | "pending prompt" => {
-                Some(Self::PendingPrompt)
-            }
-            "verifying" => Some(Self::Verifying),
-            "success" => Some(Self::Success),
-            "failure" | "failed" => Some(Self::Failure),
-            "canceled" | "cancelled" => Some(Self::Canceled),
-            "timeout" | "timed_out" => Some(Self::Timeout),
-            _ => None,
         }
     }
 }
@@ -94,7 +80,10 @@ impl Default for AuthState {
 
 impl AuthState {
     pub fn phase(&self) -> AuthPhase {
-        self.current_phase.read().map(|phase| *phase).unwrap_or(AuthPhase::Idle)
+        self.current_phase
+            .read()
+            .map(|phase| *phase)
+            .unwrap_or(AuthPhase::Idle)
     }
 
     pub fn set_phase(&self, next: AuthPhase) {
@@ -113,12 +102,6 @@ impl AuthState {
         }
 
         false
-    }
-
-    pub fn set_state(&self, next: impl AsRef<str>) {
-        if let Some(phase) = AuthPhase::from_label(next.as_ref()) {
-            self.set_phase(phase);
-        }
     }
 
     pub fn set_active_requests(&self, count: usize) {
@@ -182,11 +165,18 @@ impl<T> AuthQueue<T> {
         self.active.as_ref()
     }
 
-    pub fn active_mut(&mut self) -> Option<&mut T> {
-        self.active.as_mut()
+    pub fn take_active_if<F>(&mut self, mut predicate: F) -> Option<T>
+    where
+        F: FnMut(&T) -> bool,
+    {
+        if self.active.as_ref().is_some_and(&mut predicate) {
+            return self.complete_active();
+        }
+
+        None
     }
 
-    pub fn take_active_if<F>(&mut self, mut predicate: F) -> Option<T>
+    pub fn complete_active_if<F>(&mut self, mut predicate: F) -> Option<T>
     where
         F: FnMut(&T) -> bool,
     {
@@ -213,10 +203,6 @@ impl<T> AuthQueue<T> {
         let finished = self.active.take();
         self.promote_next();
         finished
-    }
-
-    pub fn cancel_active(&mut self) -> Option<T> {
-        self.complete_active()
     }
 
     pub fn active_len(&self) -> usize {
@@ -262,7 +248,11 @@ impl RuntimeState {
         Self::with_auth(socket_path, backend_name, Arc::new(AuthState::default()))
     }
 
-    pub fn with_auth(socket_path: String, backend_name: &'static str, auth: Arc<AuthState>) -> Self {
+    pub fn with_auth(
+        socket_path: String,
+        backend_name: &'static str,
+        auth: Arc<AuthState>,
+    ) -> Self {
         auth.set_phase(AuthPhase::Idle);
         auth.set_active_requests(0);
         auth.set_queued_requests(0);

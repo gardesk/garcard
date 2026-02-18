@@ -21,5 +21,10 @@ Environment overrides:
 4. `GARCARD_AGENT_BACKEND`
 5. `GARCARD_POLKIT_OBJECT_PATH`
 6. `GARCARD_LOCALE`
+7. `GARCARD_POLKIT_HELPER_SOCKET`
+8. `GARCARD_PROMPT_COMMAND`
 
 See `examples/config.toml` for a starter file.
+
+`GARCARD_PROMPT_COMMAND` is optional. If unset, `garcard` falls back to
+`systemd-ask-password` for prompt interaction.

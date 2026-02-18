@@ -86,14 +86,20 @@ impl HelperSocketClient {
 
             match parse_helper_line(&line)? {
                 HelperEvent::PromptHidden(prompt) => {
-                    match prompts.prompt_secret(&prompt).context("prompt handler failed")? {
+                    match prompts
+                        .prompt_secret(&prompt)
+                        .context("prompt handler failed")?
+                    {
                         Some(response) => write_line(&mut stream, &sanitize_response(&response))
                             .context("failed to send helper secret response")?,
                         None => return Ok(HelperOutcome::Canceled),
                     }
                 }
                 HelperEvent::PromptVisible(prompt) => {
-                    match prompts.prompt_plain(&prompt).context("prompt handler failed")? {
+                    match prompts
+                        .prompt_plain(&prompt)
+                        .context("prompt handler failed")?
+                    {
                         Some(response) => write_line(&mut stream, &sanitize_response(&response))
                             .context("failed to send helper visible response")?,
                         None => return Ok(HelperOutcome::Canceled),

@@ -1,7 +1,12 @@
+use crate::polkit_helper::{DEFAULT_HELPER_SOCKET, HelperOutcome, HelperSocketClient};
+use crate::prompt::CommandPrompt;
 use crate::state::{AuthPhase, AuthQueue, AuthState, QueueInsert};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use zbus::blocking::{Connection, Proxy};
 use zbus::fdo;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
@@ -53,21 +58,49 @@ struct AuthRequest {
     identities: Vec<Subject>,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveRequest {
+    action_id: String,
+    message: String,
+    icon_name: String,
+    detail_count: usize,
+    cookie: String,
+    username: String,
+}
+
 #[derive(Debug)]
 struct PolkitRuntime {
     auth_state: Arc<AuthState>,
     queue: Mutex<AuthQueue<AuthRequest>>,
+    helper_client: HelperSocketClient,
+    processing: AtomicBool,
+    worker_enabled: bool,
 }
 
 impl PolkitRuntime {
     fn new(auth_state: Arc<AuthState>) -> Self {
+        Self::new_with_worker(auth_state, true)
+    }
+
+    #[cfg(test)]
+    fn new_without_worker(auth_state: Arc<AuthState>) -> Self {
+        Self::new_with_worker(auth_state, false)
+    }
+
+    fn new_with_worker(auth_state: Arc<AuthState>, worker_enabled: bool) -> Self {
+        let helper_socket = std::env::var_os("GARCARD_POLKIT_HELPER_SOCKET")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_HELPER_SOCKET));
         Self {
             auth_state,
             queue: Mutex::new(AuthQueue::default()),
+            helper_client: HelperSocketClient::new(helper_socket),
+            processing: AtomicBool::new(false),
+            worker_enabled,
         }
     }
 
-    fn begin_authentication(&self, request: AuthRequest) -> Result<QueueInsert> {
+    fn begin_authentication(self: &Arc<Self>, request: AuthRequest) -> Result<QueueInsert> {
         let (insert, active, queued) = {
             let mut queue = self
                 .queue
@@ -90,10 +123,14 @@ impl PolkitRuntime {
             self.auth_state.set_phase(AuthPhase::PendingPrompt);
         }
 
+        if self.worker_enabled && active > 0 {
+            self.ensure_worker();
+        }
+
         Ok(insert)
     }
 
-    fn cancel_authentication(&self, cookie: &str) -> Result<bool> {
+    fn cancel_authentication(self: &Arc<Self>, cookie: &str) -> Result<bool> {
         let (canceled_active, removed_queued, active, queued) = {
             let mut queue = self
                 .queue
@@ -118,6 +155,9 @@ impl PolkitRuntime {
             } else {
                 self.auth_state.set_phase(AuthPhase::Canceled);
             }
+            if self.worker_enabled && active > 0 {
+                self.ensure_worker();
+            }
             return Ok(true);
         }
 
@@ -131,13 +171,188 @@ impl PolkitRuntime {
         Ok(false)
     }
 
+    fn ensure_worker(self: &Arc<Self>) {
+        if self.processing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let runtime = Arc::clone(self);
+        let spawn_result = thread::Builder::new()
+            .name("garcard-auth-worker".to_string())
+            .spawn(move || runtime.process_loop());
+        if let Err(err) = spawn_result {
+            self.processing.store(false, Ordering::Release);
+            tracing::error!(error = %err, "Failed to spawn garcard auth worker");
+        }
+    }
+
+    fn process_loop(self: Arc<Self>) {
+        loop {
+            let Some(active) = self.active_request_snapshot() else {
+                break;
+            };
+
+            self.auth_state.set_phase(AuthPhase::Verifying);
+            tracing::info!(
+                action_id = %active.action_id,
+                icon_name = %active.icon_name,
+                detail_count = active.detail_count,
+                "Processing polkit auth request"
+            );
+
+            let outcome = self.authenticate_active_request(&active);
+            self.complete_request(&active.cookie, outcome);
+        }
+
+        self.processing.store(false, Ordering::Release);
+        if self.has_active_request() {
+            self.ensure_worker();
+        }
+    }
+
+    fn has_active_request(&self) -> bool {
+        self.queue
+            .lock()
+            .map(|queue| queue.active().is_some())
+            .unwrap_or(false)
+    }
+
+    fn active_request_snapshot(&self) -> Option<ActiveRequest> {
+        let queue = self.queue.lock().ok()?;
+        let request = queue.active()?;
+
+        let username = resolve_identity_username(&request.identities)
+            .or_else(current_username)
+            .or_else(|| std::env::var("USER").ok())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        Some(ActiveRequest {
+            action_id: request.action_id.clone(),
+            message: request.message.clone(),
+            icon_name: request.icon_name.clone(),
+            detail_count: request.details.len(),
+            cookie: request.cookie.clone(),
+            username,
+        })
+    }
+
+    fn authenticate_active_request(&self, request: &ActiveRequest) -> HelperOutcome {
+        let mut prompts = CommandPrompt::default();
+        let prompt_context = if request.message.is_empty() {
+            request.action_id.as_str()
+        } else {
+            request.message.as_str()
+        };
+        tracing::info!(context = %prompt_context, "Starting helper authentication dialog");
+
+        match self
+            .helper_client
+            .authenticate(&request.username, &request.cookie, &mut prompts)
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::warn!(
+                    action_id = %request.action_id,
+                    error = %err,
+                    "Polkit helper authentication failed"
+                );
+                HelperOutcome::Denied
+            }
+        }
+    }
+
+    fn complete_request(&self, cookie: &str, outcome: HelperOutcome) {
+        let (removed, active, queued) = {
+            let mut queue = match self.queue.lock() {
+                Ok(queue) => queue,
+                Err(_) => {
+                    tracing::error!("auth request queue lock poisoned");
+                    return;
+                }
+            };
+            let removed = queue
+                .complete_active_if(|request| request.cookie == cookie)
+                .is_some();
+            let (active, queued) = queue.counts();
+            (removed, active, queued)
+        };
+
+        self.auth_state.sync_queue_counts(active, queued);
+        if !removed {
+            if active == 0 && queued == 0 && self.auth_state.phase() == AuthPhase::Verifying {
+                self.auth_state.set_phase(AuthPhase::Idle);
+            }
+            return;
+        }
+
+        if active > 0 {
+            self.auth_state.set_phase(AuthPhase::PendingPrompt);
+            return;
+        }
+
+        let phase = match outcome {
+            HelperOutcome::Authorized => AuthPhase::Success,
+            HelperOutcome::Denied => AuthPhase::Failure,
+            HelperOutcome::Canceled => AuthPhase::Canceled,
+        };
+        self.auth_state.set_phase(phase);
+    }
+
     fn reset(&self) {
         if let Ok(mut queue) = self.queue.lock() {
             queue.clear();
         }
+        self.processing.store(false, Ordering::Release);
         self.auth_state.set_phase(AuthPhase::Idle);
         self.auth_state.sync_queue_counts(0, 0);
     }
+}
+
+fn resolve_identity_username(identities: &[Subject]) -> Option<String> {
+    for (kind, details) in identities {
+        if kind != "unix-user" {
+            continue;
+        }
+
+        if let Some(value) = details.get("name") {
+            if let Ok(name) = <&str>::try_from(value) {
+                return Some(name.to_string());
+            }
+        }
+
+        if let Some(uid) = details.get("uid").and_then(parse_uid) {
+            if let Some(name) = username_for_uid(uid) {
+                return Some(name);
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_uid(value: &OwnedValue) -> Option<u32> {
+    if let Ok(uid) = u32::try_from(value) {
+        return Some(uid);
+    }
+    if let Ok(uid) = u64::try_from(value) {
+        return u32::try_from(uid).ok();
+    }
+    if let Ok(uid) = i32::try_from(value) {
+        return u32::try_from(uid).ok();
+    }
+
+    None
+}
+
+fn username_for_uid(uid: u32) -> Option<String> {
+    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|user| user.name)
+}
+
+fn current_username() -> Option<String> {
+    username_for_uid(nix::unistd::geteuid().as_raw())
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +377,8 @@ impl PolkitAuthAgentObject {
         cookie: &str,
         identities: Vec<Subject>,
     ) -> fdo::Result<()> {
+        let detail_count = details.len();
+        let identity_count = identities.len();
         let request = AuthRequest {
             action_id: action_id.to_string(),
             message: message.to_string(),
@@ -178,11 +395,20 @@ impl PolkitAuthAgentObject {
 
         match queue_insert {
             QueueInsert::Activated => {
-                tracing::info!(action_id = %action_id, "Started active polkit auth request");
+                tracing::info!(
+                    action_id = %action_id,
+                    icon_name = %icon_name,
+                    detail_count,
+                    identity_count,
+                    "Started active polkit auth request"
+                );
             }
             QueueInsert::Queued { position } => {
                 tracing::info!(
                     action_id = %action_id,
+                    icon_name = %icon_name,
+                    detail_count,
+                    identity_count,
                     queue_position = position,
                     "Queued polkit auth request"
                 );
@@ -404,7 +630,7 @@ mod tests {
     #[test]
     fn runtime_begin_authentication_updates_state_and_counts() {
         let auth_state = Arc::new(AuthState::default());
-        let runtime = PolkitRuntime::new(Arc::clone(&auth_state));
+        let runtime = Arc::new(PolkitRuntime::new_without_worker(Arc::clone(&auth_state)));
 
         let insert = runtime
             .begin_authentication(fake_request("cookie-1"))
@@ -418,7 +644,7 @@ mod tests {
     #[test]
     fn runtime_cancel_authentication_drops_active_request() {
         let auth_state = Arc::new(AuthState::default());
-        let runtime = PolkitRuntime::new(Arc::clone(&auth_state));
+        let runtime = Arc::new(PolkitRuntime::new_without_worker(Arc::clone(&auth_state)));
         runtime
             .begin_authentication(fake_request("cookie-1"))
             .expect("begin");
@@ -433,7 +659,7 @@ mod tests {
     #[test]
     fn runtime_cancel_authentication_removes_queued_request() {
         let auth_state = Arc::new(AuthState::default());
-        let runtime = PolkitRuntime::new(Arc::clone(&auth_state));
+        let runtime = Arc::new(PolkitRuntime::new_without_worker(Arc::clone(&auth_state)));
         runtime
             .begin_authentication(fake_request("cookie-1"))
             .expect("begin first");
@@ -445,5 +671,18 @@ mod tests {
         assert!(canceled);
         assert_eq!(auth_state.summary().active_requests, 1);
         assert_eq!(auth_state.summary().queued_requests, 0);
+    }
+
+    #[test]
+    fn resolve_identity_username_uses_uid_detail() {
+        let mut details = HashMap::new();
+        details.insert(
+            "uid".to_string(),
+            OwnedValue::from(nix::unistd::geteuid().as_raw()),
+        );
+        let identities = vec![("unix-user".to_string(), details)];
+
+        let resolved = resolve_identity_username(&identities);
+        assert_eq!(resolved, current_username());
     }
 }

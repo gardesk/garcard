@@ -122,21 +122,25 @@ fn init_backend(config: &Config, auth_state: Arc<AuthState>) -> Result<Box<dyn A
             Ok(backend)
         }
         AgentBackendMode::Polkit => {
-            let mut backend: Box<dyn AuthAgentBackend> =
-                Box::new(PolkitAgent::new(PolkitBackendConfig {
+            let mut backend: Box<dyn AuthAgentBackend> = Box::new(PolkitAgent::new(
+                PolkitBackendConfig {
                     object_path: config.polkit_object_path.clone(),
                     locale: config.locale.clone(),
-                }, Arc::clone(&auth_state))?);
+                },
+                Arc::clone(&auth_state),
+            )?);
             backend.register()?;
             Ok(backend)
         }
         AgentBackendMode::Auto => {
             let attempt = (|| -> Result<Box<dyn AuthAgentBackend>> {
-                let mut backend: Box<dyn AuthAgentBackend> =
-                    Box::new(PolkitAgent::new(PolkitBackendConfig {
+                let mut backend: Box<dyn AuthAgentBackend> = Box::new(PolkitAgent::new(
+                    PolkitBackendConfig {
                         object_path: config.polkit_object_path.clone(),
                         locale: config.locale.clone(),
-                    }, Arc::clone(&auth_state))?);
+                    },
+                    Arc::clone(&auth_state),
+                )?);
                 backend.register()?;
                 Ok(backend)
             })();
