@@ -7,6 +7,9 @@ authors.workspace = true
 
 [dependencies]
 garcard-ipc.workspace = true
+gartk-core.workspace = true
+gartk-render.workspace = true
+gartk-x11.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true
@@ -19,3 +22,4 @@ toml.workspace = true
 serde.workspace = true
 zbus.workspace = true
 nix.workspace = true
+x11rb.workspace = true

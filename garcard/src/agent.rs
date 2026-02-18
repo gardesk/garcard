@@ -294,6 +294,7 @@ impl PolkitRuntime {
             HelperOutcome::Authorized => AuthPhase::Success,
             HelperOutcome::Denied => AuthPhase::Failure,
             HelperOutcome::Canceled => AuthPhase::Canceled,
+            HelperOutcome::Timeout => AuthPhase::Timeout,
         };
         self.auth_state.set_phase(phase);
     }

@@ -3,10 +3,11 @@ mod config;
 mod daemon;
 mod polkit_helper;
 mod prompt;
+mod prompt_ui;
 mod state;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -27,6 +28,27 @@ struct Cli {
 enum Commands {
     /// Start daemon mode
     Daemon,
+    /// Run interactive auth prompt mode (used internally by daemon)
+    Prompt(PromptArgs),
+}
+
+#[derive(Parser, Debug)]
+struct PromptArgs {
+    /// Prompt message to display
+    #[arg(long)]
+    message: String,
+    /// Input mode
+    #[arg(long, value_enum, default_value_t = PromptModeArg::Secret)]
+    mode: PromptModeArg,
+    /// Prompt timeout in seconds
+    #[arg(long, default_value_t = 120)]
+    timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PromptModeArg {
+    Secret,
+    Plain,
 }
 
 #[tokio::main]
@@ -39,6 +61,37 @@ async fn main() -> Result<()> {
         Commands::Daemon => {
             let config = config::Config::load()?;
             daemon::run(config).await
+        }
+        Commands::Prompt(args) => {
+            let request = prompt_ui::PromptRequest {
+                message: args.message,
+                mode: match args.mode {
+                    PromptModeArg::Secret => prompt_ui::PromptMode::Secret,
+                    PromptModeArg::Plain => prompt_ui::PromptMode::Plain,
+                },
+                timeout_secs: args.timeout_secs,
+            };
+
+            let outcome = match prompt_ui::run_prompt_dialog(request) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    eprintln!("garcard prompt backend unavailable: {}", err);
+                    std::process::exit(2);
+                }
+            };
+
+            match outcome {
+                prompt_ui::PromptExit::Submitted(value) => {
+                    println!("{}", value);
+                    Ok(())
+                }
+                prompt_ui::PromptExit::Canceled => {
+                    std::process::exit(1);
+                }
+                prompt_ui::PromptExit::TimedOut => {
+                    std::process::exit(124);
+                }
+            }
         }
     }
 }

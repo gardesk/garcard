@@ -39,6 +39,7 @@ impl fmt::Display for AuthPhase {
     }
 }
 
+#[allow(dead_code)]
 fn can_transition(current: AuthPhase, next: AuthPhase) -> bool {
     if current == next {
         return true;
@@ -92,6 +93,7 @@ impl AuthState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn transition(&self, next: AuthPhase) -> bool {
         if let Ok(mut phase) = self.current_phase.write() {
             if can_transition(*phase, next) {
@@ -213,6 +215,7 @@ impl<T> AuthQueue<T> {
         self.queued.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.active.is_none() && self.queued.is_empty()
     }
@@ -244,6 +247,7 @@ pub struct RuntimeState {
 }
 
 impl RuntimeState {
+    #[cfg(test)]
     pub fn new(socket_path: String, backend_name: &'static str) -> Self {
         Self::with_auth(socket_path, backend_name, Arc::new(AuthState::default()))
     }

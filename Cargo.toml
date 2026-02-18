@@ -10,6 +10,9 @@ authors = ["gardesk contributors"]
 
 [workspace.dependencies]
 garcard-ipc = { path = "garcard-ipc" }
+gartk-core = { path = "../gartk/gartk-core" }
+gartk-render = { path = "../gartk/gartk-render" }
+gartk-x11 = { path = "../gartk/gartk-x11" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -22,3 +25,4 @@ dirs = "5"
 toml = "0.8"
 zbus = "4"
 nix = { version = "0.29", features = ["user"] }
+x11rb = { version = "0.13", features = ["randr"] }

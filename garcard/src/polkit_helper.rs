@@ -10,6 +10,7 @@ pub enum HelperOutcome {
     Authorized,
     Denied,
     Canceled,
+    Timeout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,9 +23,16 @@ pub enum HelperEvent {
     Failure,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptResponse {
+    Submitted(String),
+    Canceled,
+    TimedOut,
+}
+
 pub trait PromptProvider {
-    fn prompt_secret(&mut self, prompt: &str) -> Result<Option<String>>;
-    fn prompt_plain(&mut self, prompt: &str) -> Result<Option<String>>;
+    fn prompt_secret(&mut self, prompt: &str) -> Result<PromptResponse>;
+    fn prompt_plain(&mut self, prompt: &str) -> Result<PromptResponse>;
 
     fn show_error(&mut self, _message: &str) -> Result<()> {
         Ok(())
@@ -90,9 +98,12 @@ impl HelperSocketClient {
                         .prompt_secret(&prompt)
                         .context("prompt handler failed")?
                     {
-                        Some(response) => write_line(&mut stream, &sanitize_response(&response))
-                            .context("failed to send helper secret response")?,
-                        None => return Ok(HelperOutcome::Canceled),
+                        PromptResponse::Submitted(response) => {
+                            write_line(&mut stream, &sanitize_response(&response))
+                                .context("failed to send helper secret response")?
+                        }
+                        PromptResponse::Canceled => return Ok(HelperOutcome::Canceled),
+                        PromptResponse::TimedOut => return Ok(HelperOutcome::Timeout),
                     }
                 }
                 HelperEvent::PromptVisible(prompt) => {
@@ -100,9 +111,12 @@ impl HelperSocketClient {
                         .prompt_plain(&prompt)
                         .context("prompt handler failed")?
                     {
-                        Some(response) => write_line(&mut stream, &sanitize_response(&response))
-                            .context("failed to send helper visible response")?,
-                        None => return Ok(HelperOutcome::Canceled),
+                        PromptResponse::Submitted(response) => {
+                            write_line(&mut stream, &sanitize_response(&response))
+                                .context("failed to send helper visible response")?
+                        }
+                        PromptResponse::Canceled => return Ok(HelperOutcome::Canceled),
+                        PromptResponse::TimedOut => return Ok(HelperOutcome::Timeout),
                     }
                 }
                 HelperEvent::Error(message) => {
@@ -166,20 +180,30 @@ mod tests {
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[derive(Default)]
     struct FakePrompt {
-        secret_response: Option<String>,
-        plain_response: Option<String>,
+        secret_response: PromptResponse,
+        plain_response: PromptResponse,
         infos: Vec<String>,
         errors: Vec<String>,
     }
 
+    impl Default for FakePrompt {
+        fn default() -> Self {
+            Self {
+                secret_response: PromptResponse::Canceled,
+                plain_response: PromptResponse::Canceled,
+                infos: Vec::new(),
+                errors: Vec::new(),
+            }
+        }
+    }
+
     impl PromptProvider for FakePrompt {
-        fn prompt_secret(&mut self, _prompt: &str) -> Result<Option<String>> {
+        fn prompt_secret(&mut self, _prompt: &str) -> Result<PromptResponse> {
             Ok(self.secret_response.clone())
         }
 
-        fn prompt_plain(&mut self, _prompt: &str) -> Result<Option<String>> {
+        fn prompt_plain(&mut self, _prompt: &str) -> Result<PromptResponse> {
             Ok(self.plain_response.clone())
         }
 
@@ -282,8 +306,8 @@ mod tests {
 
         let client = HelperSocketClient::new(&socket_path);
         let mut prompts = FakePrompt {
-            secret_response: Some("correct horse".to_string()),
-            plain_response: None,
+            secret_response: PromptResponse::Submitted("correct horse".to_string()),
+            plain_response: PromptResponse::Canceled,
             infos: Vec::new(),
             errors: Vec::new(),
         };
@@ -297,6 +321,44 @@ mod tests {
         let lines = transcript.lock().expect("lock transcript");
         assert_eq!(lines.as_slice(), ["alice", "cookie-123", "correct horse"]);
 
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn helper_client_reports_timeout_from_prompt_provider() {
+        let socket_path = temp_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let read_stream = stream.try_clone().expect("clone");
+            let mut reader = BufReader::new(read_stream);
+
+            let mut username = String::new();
+            reader.read_line(&mut username).expect("read username");
+            let mut cookie = String::new();
+            reader.read_line(&mut cookie).expect("read cookie");
+
+            stream
+                .write_all(b"PAM_PROMPT_ECHO_OFF Password:\n")
+                .expect("write prompt");
+            stream.flush().expect("flush prompt");
+        });
+
+        let client = HelperSocketClient::new(&socket_path);
+        let mut prompts = FakePrompt {
+            secret_response: PromptResponse::TimedOut,
+            plain_response: PromptResponse::Canceled,
+            infos: Vec::new(),
+            errors: Vec::new(),
+        };
+
+        let outcome = client
+            .authenticate("alice", "cookie-timeout", &mut prompts)
+            .expect("authenticate timeout");
+        assert_eq!(outcome, HelperOutcome::Timeout);
+
+        server.join().expect("server join");
         let _ = std::fs::remove_file(&socket_path);
     }
 }

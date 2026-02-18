@@ -10,6 +10,7 @@
 ## Quick Start
 1. `cargo run -p garcard -- daemon`
 2. `cargo run -p garcardctl -- status`
+3. `cargo run -p garcard -- prompt --mode secret --message "Validation prompt"`
 
 ## Config
 Default config path: `~/.config/garcard/config.toml`
@@ -23,8 +24,10 @@ Environment overrides:
 6. `GARCARD_LOCALE`
 7. `GARCARD_POLKIT_HELPER_SOCKET`
 8. `GARCARD_PROMPT_COMMAND`
+9. `GARCARD_PROMPT_TIMEOUT_SECS`
 
 See `examples/config.toml` for a starter file.
 
-`GARCARD_PROMPT_COMMAND` is optional. If unset, `garcard` falls back to
-`systemd-ask-password` for prompt interaction.
+`GARCARD_PROMPT_COMMAND` is optional. If unset, `garcard` runs the built-in
+`garcard prompt` gartk dialog path and falls back to `systemd-ask-password`
+when the X11 prompt backend is unavailable.
