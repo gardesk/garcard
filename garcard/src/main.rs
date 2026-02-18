@@ -1,6 +1,7 @@
 mod agent;
 mod config;
 mod daemon;
+mod polkit_helper;
 mod state;
 
 use anyhow::Result;
