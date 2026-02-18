@@ -36,11 +36,19 @@ Result:
    - `garcardctl auth-summary` remained consistent.
 
 ## Optional Root-Level Disruption Check
-1. Attempted `systemctl restart polkit`.
-2. Result: `Access denied` (no root/system permission from this validation context).
-3. Root-level service restart scenario remains for host-owner execution if desired.
+1. Baseline probe before restart:
+   - `pkcheck --allow-user-interaction --process $$ --action-id com.mesonbuild.install.run`
+   - Exit code `1` (`Not authorized.`) with live callback logs observed.
+2. Host-owner executed `sudo systemctl restart polkit` while daemon remained running.
+3. Post-restart probe:
+   - `pkcheck --allow-user-interaction --process $$ --action-id com.mesonbuild.install.run`
+   - Exit code `1` (`Not authorized.`), and no `no agent available` error.
+4. Daemon maintenance logs confirmed recovery:
+   - `Re-registered polkit auth agent during maintenance`
+5. Daemon health remained stable:
+   - `garcardctl status` responsive with `agent_backend: polkit`.
 
 ## Conclusion
 1. Sprint 02 auth callback path is live and receiving real polkit challenge requests.
 2. Timeout state is observable and propagated through IPC summary.
-3. Backend reconnect behavior is validated through forced reconnect workflow.
+3. Backend reconnect behavior is validated through forced reconnect workflow and real `polkit` service restart recovery.

@@ -490,6 +490,27 @@ impl PolkitAgent {
         let _: () = Self::peer_proxy(connection)?.call("Ping", &())?;
         Ok(())
     }
+
+    fn register_with_authority(
+        connection: &Connection,
+        subject: &Subject,
+        locale: &str,
+        object_path: &str,
+    ) -> Result<()> {
+        let proxy = Self::proxy(connection)?;
+        let _: () = proxy.call(
+            "RegisterAuthenticationAgent",
+            &(subject, locale, object_path),
+        )?;
+        Ok(())
+    }
+
+    fn is_already_registered_error(err: &anyhow::Error) -> bool {
+        let message = err.to_string().to_ascii_lowercase();
+        message.contains("already exists")
+            || message.contains("already registered")
+            || message.contains("authentication agent already")
+    }
 }
 
 impl AuthAgentBackend for PolkitAgent {
@@ -517,18 +538,12 @@ impl AuthAgentBackend for PolkitAgent {
             );
         }
 
-        let register_result = (|| -> Result<()> {
-            let proxy = Self::proxy(&connection)?;
-            let _: () = proxy.call(
-                "RegisterAuthenticationAgent",
-                &(
-                    &self.subject,
-                    self.locale.as_str(),
-                    self.object_path.to_string(),
-                ),
-            )?;
-            Ok(())
-        })();
+        let register_result = Self::register_with_authority(
+            &connection,
+            &self.subject,
+            self.locale.as_str(),
+            self.object_path.as_str(),
+        );
 
         if let Err(err) = register_result {
             let _ = connection
@@ -600,7 +615,37 @@ impl AuthAgentBackend for PolkitAgent {
         let is_healthy = self
             .connection
             .as_ref()
-            .map(|connection| Self::ping_authority(connection).is_ok())
+            .map(|connection| {
+                let ping_ok = Self::ping_authority(connection).is_ok();
+                if !ping_ok {
+                    return false;
+                }
+
+                let reassert = Self::register_with_authority(
+                    connection,
+                    &self.subject,
+                    self.locale.as_str(),
+                    self.object_path.as_str(),
+                );
+                match reassert {
+                    Ok(()) => {
+                        tracing::info!(
+                            backend = self.name(),
+                            "Re-registered polkit auth agent during maintenance"
+                        );
+                        true
+                    }
+                    Err(err) if Self::is_already_registered_error(&err) => true,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            backend = self.name(),
+                            "Failed to re-assert polkit auth agent registration"
+                        );
+                        false
+                    }
+                }
+            })
             .unwrap_or(false);
         if is_healthy {
             return Ok(());
