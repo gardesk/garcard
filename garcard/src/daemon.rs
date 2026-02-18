@@ -1,6 +1,6 @@
 use crate::agent::{AuthAgentBackend, PolkitAgent, PolkitBackendConfig, StubPolkitAgent};
 use crate::config::{AgentBackendMode, Config};
-use crate::state::RuntimeState;
+use crate::state::{AuthState, RuntimeState};
 use anyhow::{Context, Result};
 use garcard_ipc::{Command, Response};
 use serde_json::json;
@@ -29,7 +29,8 @@ impl Drop for SocketGuard {
 }
 
 pub async fn run(config: Config) -> Result<()> {
-    let mut backend = init_backend(&config)?;
+    let auth_state = Arc::new(AuthState::default());
+    let mut backend = init_backend(&config, Arc::clone(&auth_state))?;
 
     prepare_socket(&config.socket_path).await?;
     if let Some(parent) = config.socket_path.parent() {
@@ -52,9 +53,10 @@ pub async fn run(config: Config) -> Result<()> {
     })?;
 
     let _socket_guard = SocketGuard::new(config.socket_path.clone());
-    let state = Arc::new(RuntimeState::new(
+    let state = Arc::new(RuntimeState::with_auth(
         config.socket_path.display().to_string(),
         backend.name(),
+        auth_state,
     ));
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
 
@@ -112,7 +114,7 @@ pub async fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
-fn init_backend(config: &Config) -> Result<Box<dyn AuthAgentBackend>> {
+fn init_backend(config: &Config, auth_state: Arc<AuthState>) -> Result<Box<dyn AuthAgentBackend>> {
     match config.agent_backend {
         AgentBackendMode::Stub => {
             let mut backend: Box<dyn AuthAgentBackend> = Box::new(StubPolkitAgent);
@@ -124,7 +126,7 @@ fn init_backend(config: &Config) -> Result<Box<dyn AuthAgentBackend>> {
                 Box::new(PolkitAgent::new(PolkitBackendConfig {
                     object_path: config.polkit_object_path.clone(),
                     locale: config.locale.clone(),
-                })?);
+                }, Arc::clone(&auth_state))?);
             backend.register()?;
             Ok(backend)
         }
@@ -134,7 +136,7 @@ fn init_backend(config: &Config) -> Result<Box<dyn AuthAgentBackend>> {
                     Box::new(PolkitAgent::new(PolkitBackendConfig {
                         object_path: config.polkit_object_path.clone(),
                         locale: config.locale.clone(),
-                    })?);
+                    }, Arc::clone(&auth_state))?);
                 backend.register()?;
                 Ok(backend)
             })();
@@ -272,7 +274,8 @@ mod tests {
             locale: "C".to_string(),
         };
 
-        let backend = init_backend(&config).expect("auto mode should fall back");
+        let backend = init_backend(&config, Arc::new(AuthState::default()))
+            .expect("auto mode should fall back");
         assert_eq!(backend.name(), "stub-polkit-agent");
     }
 }

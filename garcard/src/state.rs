@@ -1,6 +1,7 @@
 use garcard_ipc::{AuthSummary, PROTOCOL_VERSION, StatusData, VersionData};
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -185,6 +186,29 @@ impl<T> AuthQueue<T> {
         self.active.as_mut()
     }
 
+    pub fn take_active_if<F>(&mut self, mut predicate: F) -> Option<T>
+    where
+        F: FnMut(&T) -> bool,
+    {
+        if self.active.as_ref().is_some_and(&mut predicate) {
+            return self.complete_active();
+        }
+
+        None
+    }
+
+    pub fn remove_queued_if<F>(&mut self, mut predicate: F) -> bool
+    where
+        F: FnMut(&T) -> bool,
+    {
+        if let Some(index) = self.queued.iter().position(&mut predicate) {
+            self.queued.remove(index);
+            return true;
+        }
+
+        false
+    }
+
     pub fn complete_active(&mut self) -> Option<T> {
         let finished = self.active.take();
         self.promote_next();
@@ -207,6 +231,11 @@ impl<T> AuthQueue<T> {
         self.active.is_none() && self.queued.is_empty()
     }
 
+    pub fn clear(&mut self) {
+        self.active = None;
+        self.queued.clear();
+    }
+
     pub fn counts(&self) -> (usize, usize) {
         (self.active_len(), self.queued_len())
     }
@@ -225,16 +254,18 @@ pub struct RuntimeState {
     pid: u32,
     socket_path: String,
     backend_name: &'static str,
-    auth: AuthState,
+    auth: Arc<AuthState>,
 }
 
 impl RuntimeState {
     pub fn new(socket_path: String, backend_name: &'static str) -> Self {
-        let auth = AuthState::default();
+        Self::with_auth(socket_path, backend_name, Arc::new(AuthState::default()))
+    }
+
+    pub fn with_auth(socket_path: String, backend_name: &'static str, auth: Arc<AuthState>) -> Self {
         auth.set_phase(AuthPhase::Idle);
         auth.set_active_requests(0);
         auth.set_queued_requests(0);
-
         Self {
             started_at: Instant::now(),
             pid: std::process::id(),
@@ -269,7 +300,7 @@ impl RuntimeState {
     }
 
     #[allow(dead_code)]
-    pub fn auth_mutation(&self) -> &AuthState {
+    pub fn auth_mutation(&self) -> &Arc<AuthState> {
         &self.auth
     }
 }
@@ -334,5 +365,28 @@ mod tests {
         assert_eq!(queue.active(), Some(&"third"));
         assert_eq!(queue.complete_active(), Some("third"));
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn auth_queue_take_active_if_promotes_next() {
+        let mut queue = AuthQueue::default();
+        queue.push("cookie-a");
+        queue.push("cookie-b");
+
+        let removed = queue.take_active_if(|value| *value == "cookie-a");
+        assert_eq!(removed, Some("cookie-a"));
+        assert_eq!(queue.active(), Some(&"cookie-b"));
+    }
+
+    #[test]
+    fn auth_queue_remove_queued_if_removes_specific_item() {
+        let mut queue = AuthQueue::default();
+        queue.push("cookie-a");
+        queue.push("cookie-b");
+        queue.push("cookie-c");
+
+        assert!(queue.remove_queued_if(|value| *value == "cookie-b"));
+        assert_eq!(queue.counts(), (1, 1));
+        assert!(!queue.remove_queued_if(|value| *value == "missing"));
     }
 }
