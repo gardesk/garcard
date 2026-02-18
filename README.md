@@ -25,6 +25,7 @@ Environment overrides:
 7. `GARCARD_POLKIT_HELPER_SOCKET`
 8. `GARCARD_PROMPT_COMMAND`
 9. `GARCARD_PROMPT_TIMEOUT_SECS`
+10. `GARCARD_BACKEND_HEALTHCHECK_SECS`
 
 See `examples/config.toml` for a starter file.
 

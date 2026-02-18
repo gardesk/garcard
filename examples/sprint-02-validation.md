@@ -58,3 +58,20 @@ Expected:
 1. One active request at a time.
 2. Additional requests queue and process FIFO.
 3. No deadlock after cancel/failure/success.
+
+## Backend Reconnect (Bus/Authority Disruption)
+1. Start daemon with visible logs:
+   - `RUST_LOG=garcard=debug cargo run -p garcard -- daemon`
+2. In another terminal, capture status:
+   - `cargo run -q -p garcardctl -- status`
+3. Force reconnect path without root:
+   - `kill -HUP <garcard-pid>`
+4. Wait at least one health interval (default 5s), then check status and logs.
+5. Optional root-level disruption check:
+   - `sudo systemctl restart polkit`
+
+Expected:
+1. Log shows forced reconnect path (`Received SIGHUP; forcing backend reconnect`).
+2. Backend re-registers without daemon process restart.
+3. `garcardctl status` remains responsive during/after reconnect attempt.
+4. Optional root-level disruption should trigger maintenance reconnect attempts.

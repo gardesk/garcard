@@ -3,25 +3,29 @@ set -euo pipefail
 
 ACTION_ID="${1:-org.freedesktop.login1.power-off}"
 
-if ! command -v garcardctl >/dev/null 2>&1; then
-  echo "garcardctl not found in PATH"
-  echo "Run from this repo with: cargo run -p garcardctl -- <command>"
-  exit 1
-fi
-
 if ! command -v pkcheck >/dev/null 2>&1; then
   echo "pkcheck not found; install polkit tools to run live auth validation"
   exit 1
 fi
 
+if command -v garcardctl >/dev/null 2>&1; then
+  GARCARDCTL=(garcardctl)
+else
+  GARCARDCTL=(cargo run -q -p garcardctl --)
+fi
+
+run_garcardctl() {
+  "${GARCARDCTL[@]}" "$@"
+}
+
 echo "[1/5] Check daemon connectivity"
-garcardctl ping
+run_garcardctl ping
 
 echo "[2/5] Check daemon status"
-garcardctl status
+run_garcardctl status
 
 echo "[3/5] Check pre-auth summary"
-garcardctl auth-summary
+run_garcardctl auth-summary
 
 echo "[4/5] Trigger interactive policy check"
 echo "Action ID: ${ACTION_ID}"
@@ -33,7 +37,7 @@ set -e
 echo "pkcheck exit code: ${PKCHECK_RC}"
 
 echo "[5/5] Check post-auth summary"
-garcardctl auth-summary
+run_garcardctl auth-summary
 
 cat <<'EOF'
 Exit code hints:

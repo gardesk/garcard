@@ -12,6 +12,7 @@ pub struct Config {
     pub agent_backend: AgentBackendMode,
     pub polkit_object_path: String,
     pub locale: String,
+    pub backend_healthcheck_secs: u64,
 }
 
 impl Default for Config {
@@ -22,6 +23,7 @@ impl Default for Config {
             agent_backend: AgentBackendMode::Auto,
             polkit_object_path: "/org/gardesk/Garcard/AuthAgent".to_string(),
             locale: std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".to_string()),
+            backend_healthcheck_secs: 5,
         }
     }
 }
@@ -49,6 +51,12 @@ impl Config {
         }
         if let Some(raw_locale) = std::env::var_os("GARCARD_LOCALE") {
             cfg.locale = raw_locale.to_string_lossy().to_string();
+        }
+        if let Some(raw_interval) = std::env::var_os("GARCARD_BACKEND_HEALTHCHECK_SECS") {
+            cfg.backend_healthcheck_secs = parse_positive_secs(&raw_interval.to_string_lossy())
+                .with_context(|| {
+                    "Invalid GARCARD_BACKEND_HEALTHCHECK_SECS (expected positive integer seconds)"
+                })?;
         }
 
         Ok(cfg)
@@ -83,6 +91,12 @@ impl Config {
         }
         if let Some(locale) = file_cfg.locale {
             self.locale = locale;
+        }
+        if let Some(backend_healthcheck_secs) = file_cfg.backend_healthcheck_secs {
+            self.backend_healthcheck_secs = parse_positive_secs(&backend_healthcheck_secs)
+                .with_context(|| {
+                "Invalid backend_healthcheck_secs in config file (expected positive integer seconds)"
+            })?;
         }
 
         Ok(())
@@ -126,6 +140,7 @@ struct FileConfig {
     agent_backend: Option<String>,
     polkit_object_path: Option<String>,
     locale: Option<String>,
+    backend_healthcheck_secs: Option<String>,
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -141,6 +156,17 @@ fn parse_octal_mode(raw: &str) -> Result<u32> {
     let mode = u32::from_str_radix(trimmed, 8)
         .with_context(|| format!("failed to parse mode value: {trimmed}"))?;
     Ok(mode)
+}
+
+fn parse_positive_secs(raw: &str) -> Result<u64> {
+    let trimmed = raw.trim();
+    let secs = trimmed
+        .parse::<u64>()
+        .with_context(|| format!("failed to parse seconds value: {trimmed}"))?;
+    if secs == 0 {
+        anyhow::bail!("seconds must be greater than zero");
+    }
+    Ok(secs)
 }
 
 #[cfg(test)]
@@ -168,6 +194,7 @@ socket_mode = "640"
 agent_backend = "stub"
 polkit_object_path = "/org/gardesk/Garcard/TestAgent"
 locale = "C"
+backend_healthcheck_secs = "7"
 "#,
         )
         .expect("parse file config");
@@ -183,6 +210,7 @@ locale = "C"
             Some("/org/gardesk/Garcard/TestAgent")
         );
         assert_eq!(parsed.locale.as_deref(), Some("C"));
+        assert_eq!(parsed.backend_healthcheck_secs.as_deref(), Some("7"));
     }
 
     #[test]
@@ -205,5 +233,16 @@ locale = "C"
     fn backend_mode_rejects_unknown() {
         let err = AgentBackendMode::from_str("bad").expect_err("should fail");
         assert!(err.to_string().contains("unsupported backend mode"));
+    }
+
+    #[test]
+    fn parse_positive_secs_rejects_zero() {
+        let err = parse_positive_secs("0").expect_err("zero should fail");
+        assert!(err.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn parse_positive_secs_accepts_positive_integer() {
+        assert_eq!(parse_positive_secs("9").expect("valid"), 9);
     }
 }

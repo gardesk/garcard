@@ -7,6 +7,7 @@ use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
@@ -64,16 +65,37 @@ pub async fn run(config: Config) -> Result<()> {
         .context("Failed to register SIGTERM handler")?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .context("Failed to register SIGINT handler")?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .context("Failed to register SIGHUP handler")?;
+    let mut backend_maintenance =
+        tokio::time::interval(Duration::from_secs(config.backend_healthcheck_secs));
+    backend_maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     tracing::info!(
         socket = %config.socket_path.display(),
         pid = state.status().pid,
         backend = backend.name(),
+        backend_healthcheck_secs = config.backend_healthcheck_secs,
         "garcard daemon started"
     );
 
     loop {
         tokio::select! {
+            _ = backend_maintenance.tick() => {
+                if let Err(err) = backend.maintain() {
+                    tracing::warn!(
+                        error = %err,
+                        backend = backend.name(),
+                        "Backend maintenance check failed"
+                    );
+                }
+            }
+            _ = sighup.recv() => {
+                tracing::info!("Received SIGHUP; forcing backend reconnect");
+                if let Err(err) = reconnect_backend(backend.as_mut()) {
+                    tracing::warn!(error = %err, backend = backend.name(), "Forced backend reconnect failed");
+                }
+            }
             _ = sigterm.recv() => {
                 tracing::info!("Received SIGTERM");
                 break;
@@ -111,6 +133,12 @@ pub async fn run(config: Config) -> Result<()> {
 
     backend.unregister()?;
     tracing::info!("garcard daemon stopped");
+    Ok(())
+}
+
+fn reconnect_backend(backend: &mut dyn AuthAgentBackend) -> Result<()> {
+    backend.unregister()?;
+    backend.register()?;
     Ok(())
 }
 
@@ -241,6 +269,9 @@ fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result as AnyResult;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn fake_state() -> RuntimeState {
         RuntimeState::new("/tmp/garcard-test.sock".to_string(), "test-backend")
@@ -276,10 +307,46 @@ mod tests {
             agent_backend: AgentBackendMode::Auto,
             polkit_object_path: "invalid path".to_string(),
             locale: "C".to_string(),
+            backend_healthcheck_secs: 5,
         };
 
         let backend = init_backend(&config, Arc::new(AuthState::default()))
             .expect("auto mode should fall back");
         assert_eq!(backend.name(), "stub-polkit-agent");
+    }
+
+    struct TrackingBackend {
+        unregister_calls: Arc<AtomicUsize>,
+        register_calls: Arc<AtomicUsize>,
+    }
+
+    impl AuthAgentBackend for TrackingBackend {
+        fn name(&self) -> &'static str {
+            "tracking-backend"
+        }
+
+        fn register(&mut self) -> AnyResult<()> {
+            self.register_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn unregister(&mut self) -> AnyResult<()> {
+            self.unregister_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reconnect_backend_calls_unregister_then_register() {
+        let unregister_calls = Arc::new(AtomicUsize::new(0));
+        let register_calls = Arc::new(AtomicUsize::new(0));
+        let mut backend = TrackingBackend {
+            unregister_calls: Arc::clone(&unregister_calls),
+            register_calls: Arc::clone(&register_calls),
+        };
+
+        reconnect_backend(&mut backend).expect("reconnect");
+        assert_eq!(unregister_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(register_calls.load(Ordering::Relaxed), 1);
     }
 }

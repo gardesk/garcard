@@ -16,6 +16,9 @@ pub trait AuthAgentBackend {
     fn name(&self) -> &'static str;
     fn register(&mut self) -> Result<()>;
     fn unregister(&mut self) -> Result<()>;
+    fn maintain(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Placeholder backend used during Sprint 01 scaffolding.
@@ -472,6 +475,21 @@ impl PolkitAgent {
         )?;
         Ok(proxy)
     }
+
+    fn peer_proxy(connection: &Connection) -> Result<Proxy<'_>> {
+        let proxy = Proxy::new(
+            connection,
+            "org.freedesktop.PolicyKit1",
+            "/org/freedesktop/PolicyKit1/Authority",
+            "org.freedesktop.DBus.Peer",
+        )?;
+        Ok(proxy)
+    }
+
+    fn ping_authority(connection: &Connection) -> Result<()> {
+        let _: () = Self::peer_proxy(connection)?.call("Ping", &())?;
+        Ok(())
+    }
 }
 
 impl AuthAgentBackend for PolkitAgent {
@@ -506,7 +524,7 @@ impl AuthAgentBackend for PolkitAgent {
                 &(
                     &self.subject,
                     self.locale.as_str(),
-                    self.object_path.clone(),
+                    self.object_path.to_string(),
                 ),
             )?;
             Ok(())
@@ -534,22 +552,29 @@ impl AuthAgentBackend for PolkitAgent {
         }
 
         if let Some(connection) = &self.connection {
-            match Self::proxy(connection)?.call::<_, _, ()>(
-                "UnregisterAuthenticationAgent",
-                &(
-                    &self.subject,
-                    self.locale.as_str(),
-                    self.object_path.clone(),
-                ),
-            ) {
-                Ok(()) => {
-                    tracing::info!(
-                        backend = self.name(),
-                        "Unregistered polkit authentication agent"
-                    );
-                }
+            match Self::proxy(connection) {
+                Ok(proxy) => match proxy.call::<_, _, ()>(
+                    "UnregisterAuthenticationAgent",
+                    &(&self.subject, self.object_path.to_string()),
+                ) {
+                    Ok(()) => {
+                        tracing::info!(
+                            backend = self.name(),
+                            "Unregistered polkit authentication agent"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "Failed to unregister polkit authentication agent"
+                        );
+                    }
+                },
                 Err(err) => {
-                    tracing::warn!(error = %err, "Failed to unregister polkit authentication agent");
+                    tracing::warn!(
+                        error = %err,
+                        "Failed to create polkit authority proxy during unregister"
+                    );
                 }
             }
 
@@ -566,16 +591,76 @@ impl AuthAgentBackend for PolkitAgent {
         self.connection = None;
         Ok(())
     }
+
+    fn maintain(&mut self) -> Result<()> {
+        if !self.registered {
+            return self.register();
+        }
+
+        let is_healthy = self
+            .connection
+            .as_ref()
+            .map(|connection| Self::ping_authority(connection).is_ok())
+            .unwrap_or(false);
+        if is_healthy {
+            return Ok(());
+        }
+
+        tracing::warn!(
+            backend = self.name(),
+            "Polkit backend health check failed; attempting reconnect"
+        );
+        let _ = self.unregister();
+        self.register()
+    }
 }
 
 fn build_subject() -> Subject {
+    if let Some(session_id) = current_session_id() {
+        let mut details = HashMap::new();
+        let value = zbus::zvariant::Value::from(session_id.as_str());
+        if let Ok(session_value) = OwnedValue::try_from(value) {
+            details.insert("session-id".to_string(), session_value);
+            return ("unix-session".to_string(), details);
+        }
+    }
+
     let mut details = HashMap::new();
     details.insert("pid".to_string(), OwnedValue::from(std::process::id()));
     details.insert(
         "uid".to_string(),
         OwnedValue::from(nix::unistd::geteuid().as_raw()),
     );
+    if let Some(start_time) = process_start_time_ticks() {
+        details.insert("start-time".to_string(), OwnedValue::from(start_time));
+    } else {
+        tracing::warn!("Unable to determine process start-time for polkit subject");
+    }
     ("unix-process".to_string(), details)
+}
+
+fn process_start_time_ticks() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let (_head, tail) = stat.rsplit_once(") ")?;
+    let mut fields = tail.split_whitespace();
+    fields.nth(19)?.parse::<u64>().ok()
+}
+
+fn current_session_id() -> Option<String> {
+    if let Ok(raw) = std::env::var("XDG_SESSION_ID") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let raw = std::fs::read_to_string("/proc/self/sessionid").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "4294967295" {
+        return None;
+    }
+
+    Some(trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -608,9 +693,15 @@ mod tests {
     #[test]
     fn subject_uses_unix_process_kind() {
         let subject = build_subject();
-        assert_eq!(subject.0, "unix-process");
-        assert!(subject.1.contains_key("pid"));
-        assert!(subject.1.contains_key("uid"));
+        match subject.0.as_str() {
+            "unix-session" => assert!(subject.1.contains_key("session-id")),
+            "unix-process" => {
+                assert!(subject.1.contains_key("pid"));
+                assert!(subject.1.contains_key("uid"));
+                assert!(subject.1.contains_key("start-time"));
+            }
+            other => panic!("unexpected subject kind: {other}"),
+        }
     }
 
     #[test]
