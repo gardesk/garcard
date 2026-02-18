@@ -27,7 +27,9 @@ Environment overrides:
 9. `GARCARD_PROMPT_TIMEOUT_SECS`
 10. `GARCARD_BACKEND_HEALTHCHECK_SECS`
 
-See `examples/config.toml` for a starter file.
+Default scaffold file for packaging/integration: `config/garcard/config.toml`
+
+See `examples/config.toml` for a minimal local starter file.
 
 `GARCARD_PROMPT_COMMAND` is optional. If unset, `garcard` runs the built-in
 `garcard prompt` gartk dialog path and falls back to `systemd-ask-password`

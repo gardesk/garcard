@@ -1,0 +1,26 @@
+# garcard default configuration
+
+# Optional explicit socket path.
+# socket_path = "/tmp/garcard.sock"
+
+# Socket mode in octal string form.
+# Typical values:
+# - 600: owner read/write
+# - 660: owner/group read/write
+socket_mode = "600"
+
+# Backend mode:
+# - auto: try polkit, then fall back to stub if unavailable
+# - polkit: require polkit backend registration
+# - stub: run with local stub backend (dev/test only)
+agent_backend = "auto"
+
+# Polkit registration object path.
+polkit_object_path = "/org/gardesk/Garcard/AuthAgent"
+
+# Locale sent to polkit authority registration.
+locale = "en_US.UTF-8"
+
+# Backend health check interval in seconds.
+# Failed checks trigger a reconnect attempt for the selected auth backend.
+backend_healthcheck_secs = "5"
