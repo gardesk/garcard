@@ -1,0 +1,18 @@
+// Temporary validation override for Sprint 03 NetworkManager challenge testing.
+//
+// Install as:
+//   sudo install -m644 examples/force-networkmanager-auth-admin.rules \
+//     /etc/polkit-1/rules.d/00-garcard-networkmanager-auth.rules
+//   sudo systemctl restart polkit
+//
+// Remove after validation:
+//   sudo rm -f /etc/polkit-1/rules.d/00-garcard-networkmanager-auth.rules
+//   sudo systemctl restart polkit
+//
+// This rule forces admin authentication for NetworkManager actions even when
+// host rules would otherwise auto-authorize networkmanager-group members.
+polkit.addRule(function(action, subject) {
+  if (action.id.indexOf("org.freedesktop.NetworkManager.") === 0) {
+    return polkit.Result.AUTH_ADMIN_KEEP;
+  }
+});
