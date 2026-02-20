@@ -18,6 +18,7 @@
    - `examples/sprint-03-validation-report-2026-02-18.md`
 3. Sprint 04 reliability harness/checklist:
    - `examples/validate-sprint-04.sh`
+   - `examples/validate-sprint-04-runtime.sh`
    - `examples/sprint-04-validation.md`
 
 ## Known Limitations

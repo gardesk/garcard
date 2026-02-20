@@ -51,6 +51,7 @@ when the X11 prompt backend is unavailable.
 4. `examples/validate-sprint-02.sh`
 5. `examples/validate-sprint-03-integration.sh`
 6. `examples/validate-sprint-04.sh`
+7. `examples/validate-sprint-04-runtime.sh`
 
 ## Troubleshooting
 1. `Authorization requires authentication but no agent is available`

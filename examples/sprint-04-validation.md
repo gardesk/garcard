@@ -19,24 +19,25 @@ Expected:
 2. `garcardctl auth-summary` updates and remains responsive across iterations.
 
 ## Daemon Restart During Active Prompt
-1. Start daemon in one terminal:
-   - `RUST_LOG=garcard=debug GARCARD_AGENT_BACKEND=polkit cargo run -p garcard -- daemon`
-2. Trigger challenge in another terminal:
-   - `pkcheck --allow-user-interaction --process $$ --action-id com.mesonbuild.install.run`
-3. While prompt is visible, restart daemon:
-   - `cargo run -q -p garcardctl -- quit`
-   - relaunch daemon command from step 1.
-4. Re-run the same `pkcheck` command.
+1. Preferred automated execution:
+   - `./examples/validate-sprint-04-runtime.sh`
+2. Manual fallback:
+   - start daemon with `GARCARD_AGENT_BACKEND=polkit`
+   - trigger `pkcheck --allow-user-interaction --process $$ --action-id com.mesonbuild.install.run`
+   - while prompt is visible, issue `garcardctl quit`, relaunch daemon, and retry probe.
 
 Expected:
 1. Active prompt interruption does not wedge daemon state.
 2. Relaunched daemon accepts new requests with clean `auth-summary`.
 
 ## Session Shutdown/Logout Race
-1. Start daemon with debug logs.
-2. Trigger an auth prompt.
-3. Send `SIGTERM` to daemon PID while request is active.
-4. Relaunch daemon and run `garcardctl status`.
+1. Preferred automated execution:
+   - `./examples/validate-sprint-04-runtime.sh`
+2. Manual fallback:
+   - start daemon with debug logs
+   - trigger auth prompt
+   - send `SIGTERM` to daemon PID while request is active
+   - relaunch daemon and confirm `garcardctl status`.
 
 Expected:
 1. Daemon exits cleanly without stale socket.
