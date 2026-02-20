@@ -98,9 +98,12 @@ impl HelperSocketClient {
                         .prompt_secret(&prompt)
                         .context("prompt handler failed")?
                     {
-                        PromptResponse::Submitted(response) => {
-                            write_line(&mut stream, &sanitize_response(&response))
-                                .context("failed to send helper secret response")?
+                        PromptResponse::Submitted(mut response) => {
+                            let mut sanitized = sanitize_response(&response);
+                            write_line(&mut stream, &sanitized)
+                                .context("failed to send helper secret response")?;
+                            scrub_string(&mut sanitized);
+                            scrub_string(&mut response);
                         }
                         PromptResponse::Canceled => return Ok(HelperOutcome::Canceled),
                         PromptResponse::TimedOut => return Ok(HelperOutcome::Timeout),
@@ -111,9 +114,12 @@ impl HelperSocketClient {
                         .prompt_plain(&prompt)
                         .context("prompt handler failed")?
                     {
-                        PromptResponse::Submitted(response) => {
-                            write_line(&mut stream, &sanitize_response(&response))
-                                .context("failed to send helper visible response")?
+                        PromptResponse::Submitted(mut response) => {
+                            let mut sanitized = sanitize_response(&response);
+                            write_line(&mut stream, &sanitized)
+                                .context("failed to send helper visible response")?;
+                            scrub_string(&mut sanitized);
+                            scrub_string(&mut response);
                         }
                         PromptResponse::Canceled => return Ok(HelperOutcome::Canceled),
                         PromptResponse::TimedOut => return Ok(HelperOutcome::Timeout),
@@ -145,6 +151,14 @@ fn write_line(stream: &mut UnixStream, value: &str) -> Result<()> {
 
 fn sanitize_response(raw: &str) -> String {
     raw.lines().collect::<Vec<_>>().join(" ")
+}
+
+fn scrub_string(value: &mut String) {
+    if value.is_empty() {
+        return;
+    }
+    let mut bytes = std::mem::take(value).into_bytes();
+    bytes.fill(0);
 }
 
 pub fn parse_helper_line(raw: &str) -> Result<HelperEvent> {
@@ -360,5 +374,12 @@ mod tests {
 
         server.join().expect("server join");
         let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn scrub_string_clears_input() {
+        let mut value = "top-secret".to_string();
+        scrub_string(&mut value);
+        assert!(value.is_empty());
     }
 }

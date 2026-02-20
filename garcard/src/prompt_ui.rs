@@ -42,6 +42,7 @@ struct PromptDialog {
     exit: Option<PromptExit>,
     deadline: Option<Instant>,
     remaining_secs: Option<u64>,
+    backdrop: Color,
     card_background: Color,
     card_border: Color,
     accent: Color,
@@ -88,9 +89,11 @@ impl PromptDialog {
         let mut theme = Theme::dark();
         theme.font_family = "Sans".to_string();
         theme.font_size = 14.0;
-        let card_background = Color::from_hex("#111318").expect("valid card color");
-        let card_border = Color::from_hex("#2c3442").expect("valid border color");
-        let accent = Color::from_hex("#8ab4f8").expect("valid accent color");
+        let backdrop = Color::from_hex("#0a0b10").context("invalid prompt backdrop color")?;
+        let card_background =
+            Color::from_hex("#111318").context("invalid prompt card background color")?;
+        let card_border = Color::from_hex("#2c3442").context("invalid prompt card border color")?;
+        let accent = Color::from_hex("#8ab4f8").context("invalid prompt accent color")?;
         let size = window.size();
         let renderer = Renderer::with_theme(size.width, size.height, theme)?;
 
@@ -116,6 +119,7 @@ impl PromptDialog {
             exit: None,
             deadline,
             remaining_secs: None,
+            backdrop,
             card_background,
             card_border,
             accent,
@@ -244,8 +248,7 @@ impl PromptDialog {
         let height = size.height as i32;
         let theme = self.renderer.theme().clone();
 
-        self.renderer
-            .clear_color(Color::from_hex("#0a0b10").expect("valid backdrop color"))?;
+        self.renderer.clear_color(self.backdrop)?;
 
         let card_rect = Rect::new(
             CARD_PADDING,

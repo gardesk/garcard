@@ -3,6 +3,7 @@ use crate::config::{AgentBackendMode, Config};
 use crate::state::{AuthState, RuntimeState};
 use anyhow::{Context, Result};
 use garcard_ipc::{Command, Response};
+use nix::unistd::Uid;
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -217,6 +218,8 @@ async fn handle_client(
     state: Arc<RuntimeState>,
     shutdown_tx: mpsc::UnboundedSender<()>,
 ) -> Result<()> {
+    authorize_ipc_peer(&stream)?;
+
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -243,6 +246,26 @@ async fn handle_client(
         .context("Failed to terminate response line")?;
     writer.flush().await.context("Failed to flush response")?;
 
+    Ok(())
+}
+
+fn authorize_ipc_peer(stream: &UnixStream) -> Result<()> {
+    let peer = stream
+        .peer_cred()
+        .context("Failed to read IPC peer credentials")?;
+    let peer_uid = peer.uid();
+    let expected_uid = Uid::effective().as_raw();
+    validate_ipc_peer_uid(peer_uid, expected_uid)
+}
+
+fn validate_ipc_peer_uid(peer_uid: u32, expected_uid: u32) -> Result<()> {
+    if peer_uid != expected_uid {
+        anyhow::bail!(
+            "IPC peer uid {} does not match daemon uid {}",
+            peer_uid,
+            expected_uid
+        );
+    }
     Ok(())
 }
 
@@ -348,5 +371,16 @@ mod tests {
         reconnect_backend(&mut backend).expect("reconnect");
         assert_eq!(unregister_calls.load(Ordering::Relaxed), 1);
         assert_eq!(register_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn validate_ipc_peer_uid_allows_daemon_owner() {
+        assert!(validate_ipc_peer_uid(1000, 1000).is_ok());
+    }
+
+    #[test]
+    fn validate_ipc_peer_uid_rejects_other_user() {
+        let err = validate_ipc_peer_uid(1001, 1000).expect_err("must fail");
+        assert!(err.to_string().contains("does not match daemon uid"));
     }
 }
