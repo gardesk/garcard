@@ -66,7 +66,7 @@ impl PromptProvider for CommandPrompt {
 
 fn run_custom_prompt_command(command: &str, prompt: &str, visible: bool) -> Result<PromptResponse> {
     let mode = if visible { "plain" } else { "secret" };
-    let output = Command::new("sh")
+    let mut output = Command::new("sh")
         .arg("-c")
         .arg(command)
         .env("GARCARD_PROMPT", prompt)
@@ -74,10 +74,9 @@ fn run_custom_prompt_command(command: &str, prompt: &str, visible: bool) -> Resu
         .output()
         .with_context(|| format!("failed to run custom prompt command: {}", command))?;
 
-    Ok(map_output_to_prompt_response(
-        &output.status,
-        &output.stdout,
-    ))
+    let response = map_output_to_prompt_response(&output.status, &output.stdout);
+    scrub_bytes(&mut output.stdout);
+    Ok(response)
 }
 
 fn run_gartk_prompt_subcommand(
@@ -88,7 +87,7 @@ fn run_gartk_prompt_subcommand(
     let mode = if visible { "plain" } else { "secret" };
     let executable =
         std::env::current_exe().context("failed to resolve current executable path")?;
-    let output = Command::new(executable)
+    let mut output = Command::new(executable)
         .arg("prompt")
         .arg("--mode")
         .arg(mode)
@@ -101,13 +100,15 @@ fn run_gartk_prompt_subcommand(
 
     if output.status.code() == Some(2) {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        scrub_bytes(&mut output.stdout);
+        scrub_bytes(&mut output.stderr);
         anyhow::bail!("garcard prompt subcommand unavailable: {}", stderr);
     }
 
-    Ok(map_output_to_prompt_response(
-        &output.status,
-        &output.stdout,
-    ))
+    let response = map_output_to_prompt_response(&output.status, &output.stdout);
+    scrub_bytes(&mut output.stdout);
+    scrub_bytes(&mut output.stderr);
+    Ok(response)
 }
 
 fn run_systemd_ask_password(
@@ -124,13 +125,13 @@ fn run_systemd_ask_password(
     }
     command.arg(prompt);
 
-    let output = command
+    let mut output = command
         .output()
         .context("failed to run systemd-ask-password")?;
-    Ok(map_output_to_prompt_response(
-        &output.status,
-        &output.stdout,
-    ))
+    let response = map_output_to_prompt_response(&output.status, &output.stdout);
+    scrub_bytes(&mut output.stdout);
+    scrub_bytes(&mut output.stderr);
+    Ok(response)
 }
 
 fn map_output_to_prompt_response(status: &ExitStatus, stdout: &[u8]) -> PromptResponse {
@@ -154,6 +155,14 @@ fn extract_response(stdout: &[u8]) -> Option<String> {
     } else {
         Some(response)
     }
+}
+
+fn scrub_bytes(value: &mut Vec<u8>) {
+    if value.is_empty() {
+        return;
+    }
+    value.fill(0);
+    value.clear();
 }
 
 #[cfg(test)]
@@ -180,5 +189,12 @@ mod tests {
             .expect("run shell");
         let mapped = map_output_to_prompt_response(&status, b"");
         assert_eq!(mapped, PromptResponse::TimedOut);
+    }
+
+    #[test]
+    fn scrub_bytes_clears_vec() {
+        let mut value = b"top-secret".to_vec();
+        scrub_bytes(&mut value);
+        assert!(value.is_empty());
     }
 }

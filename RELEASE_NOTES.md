@@ -10,6 +10,7 @@
 1. Same-UID enforcement for local IPC control clients.
 2. Reduced panic surface in prompt color setup paths.
 3. Best-effort scrubbing of helper prompt response buffers after use.
+4. Reduced prompt credential lifetime by moving submitted input without cloning and scrubbing prompt output buffers.
 
 ## Validation Coverage
 1. Sprint 02 live callback and reconnect validation:

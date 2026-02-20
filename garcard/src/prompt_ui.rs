@@ -195,7 +195,9 @@ impl PromptDialog {
                 self.exit = Some(PromptExit::Canceled);
             }
             Key::Return => {
-                self.exit = Some(PromptExit::Submitted(self.input.clone()));
+                let submitted = std::mem::take(&mut self.input);
+                self.cursor = 0;
+                self.exit = Some(PromptExit::Submitted(submitted));
             }
             Key::Left => {
                 if self.cursor > 0 {
@@ -364,6 +366,7 @@ impl PromptDialog {
 
 impl Drop for PromptDialog {
     fn drop(&mut self) {
+        scrub_string(&mut self.input);
         let _ = self.window.connection().inner().free_gc(self.gc);
     }
 }
@@ -421,6 +424,14 @@ fn remove_char_at(input: &mut String, cursor: usize) {
     input.drain(start..end);
 }
 
+fn scrub_string(value: &mut String) {
+    if value.is_empty() {
+        return;
+    }
+    let mut bytes = std::mem::take(value).into_bytes();
+    bytes.fill(0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,5 +461,12 @@ mod tests {
     fn display_prefix_uses_cursor_and_mode() {
         assert_eq!(display_prefix("hello", 2, PromptMode::Plain), "he");
         assert_eq!(display_prefix("hello", 2, PromptMode::Secret), "**");
+    }
+
+    #[test]
+    fn scrub_string_clears_input() {
+        let mut value = "top-secret".to_string();
+        scrub_string(&mut value);
+        assert!(value.is_empty());
     }
 }

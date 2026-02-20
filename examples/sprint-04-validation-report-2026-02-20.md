@@ -30,6 +30,7 @@
 1. IPC control path now validates same-UID peer credentials.
 2. Prompt UI runtime path no longer relies on panic/`expect` for color parsing.
 3. Helper response buffers are scrubbed after sending to helper socket.
+4. Prompt input handling now moves submitted secrets without cloning and scrubs prompt/output buffers after use.
 
 ## Remaining Manual Sprint 04 Checks
 1. Optional interactive acceptance pass (enter valid credentials, wrong-then-retry, explicit cancel) in full desktop session.
