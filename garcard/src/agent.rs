@@ -692,15 +692,10 @@ impl AuthAgentBackend for PolkitAgent {
 }
 
 fn build_subject() -> Subject {
-    if let Some(session_id) = current_session_id() {
-        let mut details = HashMap::new();
-        let value = zbus::zvariant::Value::from(session_id.as_str());
-        if let Ok(session_value) = OwnedValue::try_from(value) {
-            details.insert("session-id".to_string(), session_value);
-            return ("unix-session".to_string(), details);
-        }
-    }
-
+    // Keep registration subject aligned with helper response subject
+    // (`polkit-agent-helper-1 --socket-activated` replies as unix-process with
+    // pidfd+uid). Registering as unix-process avoids subject-type mismatches
+    // that can surface as "No session for cookie".
     let mut details = HashMap::new();
     details.insert("pid".to_string(), OwnedValue::from(std::process::id()));
     details.insert(
@@ -720,23 +715,6 @@ fn process_start_time_ticks() -> Option<u64> {
     let (_head, tail) = stat.rsplit_once(") ")?;
     let mut fields = tail.split_whitespace();
     fields.nth(19)?.parse::<u64>().ok()
-}
-
-fn current_session_id() -> Option<String> {
-    if let Ok(raw) = std::env::var("XDG_SESSION_ID") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-
-    let raw = std::fs::read_to_string("/proc/self/sessionid").ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed == "4294967295" {
-        return None;
-    }
-
-    Some(trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -769,15 +747,10 @@ mod tests {
     #[test]
     fn subject_uses_unix_process_kind() {
         let subject = build_subject();
-        match subject.0.as_str() {
-            "unix-session" => assert!(subject.1.contains_key("session-id")),
-            "unix-process" => {
-                assert!(subject.1.contains_key("pid"));
-                assert!(subject.1.contains_key("uid"));
-                assert!(subject.1.contains_key("start-time"));
-            }
-            other => panic!("unexpected subject kind: {other}"),
-        }
+        assert_eq!(subject.0.as_str(), "unix-process");
+        assert!(subject.1.contains_key("pid"));
+        assert!(subject.1.contains_key("uid"));
+        assert!(subject.1.contains_key("start-time"));
     }
 
     #[test]
