@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use zbus::blocking::{Connection, Proxy};
 use zbus::fdo;
-use zbus::zvariant::{OwnedObjectPath, OwnedValue};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Str};
 
 /// Backend interface for Polkit agent integration.
 pub trait AuthAgentBackend {
@@ -692,10 +692,30 @@ impl AuthAgentBackend for PolkitAgent {
 }
 
 fn build_subject() -> Subject {
-    // Keep registration subject aligned with helper response subject
-    // (`polkit-agent-helper-1 --socket-activated` replies as unix-process with
-    // pidfd+uid). Registering as unix-process avoids subject-type mismatches
-    // that can surface as "No session for cookie".
+    subject_from_session_id(current_session_id())
+}
+
+fn subject_from_session_id(session_id: Option<String>) -> Subject {
+    if let Some(session_id) = session_id {
+        let mut details = HashMap::new();
+        details.insert(
+            "session-id".to_string(),
+            OwnedValue::from(Str::from(session_id.as_str())),
+        );
+        tracing::info!(
+            session_id = %session_id,
+            "Registering polkit authentication agent for unix-session subject"
+        );
+        return ("unix-session".to_string(), details);
+    }
+
+    tracing::warn!(
+        "Unable to resolve session id for polkit agent registration; falling back to unix-process subject"
+    );
+    build_unix_process_subject()
+}
+
+fn build_unix_process_subject() -> Subject {
     let mut details = HashMap::new();
     details.insert("pid".to_string(), OwnedValue::from(std::process::id()));
     details.insert(
@@ -705,9 +725,29 @@ fn build_subject() -> Subject {
     if let Some(start_time) = process_start_time_ticks() {
         details.insert("start-time".to_string(), OwnedValue::from(start_time));
     } else {
-        tracing::warn!("Unable to determine process start-time for polkit subject");
+        tracing::warn!("Unable to determine process start-time for polkit unix-process subject");
     }
     ("unix-process".to_string(), details)
+}
+
+fn current_session_id() -> Option<String> {
+    session_id_from_env().or_else(session_id_from_proc)
+}
+
+fn session_id_from_env() -> Option<String> {
+    std::env::var("XDG_SESSION_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn session_id_from_proc() -> Option<String> {
+    let raw = std::fs::read_to_string("/proc/self/sessionid").ok()?;
+    let session_id = raw.trim();
+    if session_id.is_empty() || session_id == "0" {
+        return None;
+    }
+    Some(session_id.to_string())
 }
 
 fn process_start_time_ticks() -> Option<u64> {
@@ -745,8 +785,19 @@ mod tests {
     }
 
     #[test]
-    fn subject_uses_unix_process_kind() {
-        let subject = build_subject();
+    fn subject_from_session_id_prefers_unix_session_kind() {
+        let subject = subject_from_session_id(Some("1".to_string()));
+        assert_eq!(subject.0.as_str(), "unix-session");
+        let session_id = subject
+            .1
+            .get("session-id")
+            .and_then(|value| <&str>::try_from(value).ok());
+        assert_eq!(session_id, Some("1"));
+    }
+
+    #[test]
+    fn subject_from_session_id_falls_back_to_unix_process_kind() {
+        let subject = subject_from_session_id(None);
         assert_eq!(subject.0.as_str(), "unix-process");
         assert!(subject.1.contains_key("pid"));
         assert!(subject.1.contains_key("uid"));
