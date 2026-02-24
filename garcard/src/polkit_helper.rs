@@ -211,6 +211,20 @@ pub fn parse_helper_line(raw: &str) -> Result<HelperEvent> {
         return Ok(HelperEvent::Info(message.to_string()));
     }
 
+    // Some helper builds emit plain-text diagnostics instead of PAM_* protocol
+    // lines. Classify known auth failures so callers can present proper retry UX
+    // without treating successful paths as generic errors.
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("pam_authenticate failed")
+        || lower.contains("authentication failure")
+        || lower.contains("no session for cookie")
+    {
+        return Ok(HelperEvent::Failure);
+    }
+    if line.starts_with("polkit-agent-helper-1:") {
+        return Ok(HelperEvent::Info(line.to_string()));
+    }
+
     anyhow::bail!("unsupported helper protocol line: {}", line);
 }
 
@@ -308,6 +322,30 @@ mod tests {
     fn parse_helper_line_rejects_unknown_prefix() {
         let err = parse_helper_line("WAT nope").expect_err("unknown line should fail");
         assert!(err.to_string().contains("unsupported helper protocol line"));
+    }
+
+    #[test]
+    fn parse_helper_line_maps_plaintext_failure_diagnostics() {
+        assert_eq!(
+            parse_helper_line(
+                "polkit-agent-helper-1: pam_authenticate failed: Authentication failure"
+            )
+            .expect("maps failure"),
+            HelperEvent::Failure
+        );
+        assert_eq!(
+            parse_helper_line("polkit-agent-helper-1: error response to PolicyKit daemon: GDBus.Error:org.freedesktop.PolicyKit1.Error.Failed: No session for cookie")
+                .expect("maps cookie failure"),
+            HelperEvent::Failure
+        );
+    }
+
+    #[test]
+    fn parse_helper_line_maps_plaintext_info() {
+        assert_eq!(
+            parse_helper_line("polkit-agent-helper-1: informational message").expect("maps info"),
+            HelperEvent::Info("polkit-agent-helper-1: informational message".to_string())
+        );
     }
 
     #[test]
