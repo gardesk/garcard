@@ -77,7 +77,7 @@ impl HelperSocketClient {
         cookie: &str,
         prompts: &mut P,
     ) -> Result<HelperOutcome> {
-        let username_line = sanitize_control_line(username);
+        let username_label = sanitize_control_line(username);
         let cookie_line = sanitize_control_line(cookie);
         let mut stream = UnixStream::connect(&self.socket_path).with_context(|| {
             format!(
@@ -87,16 +87,17 @@ impl HelperSocketClient {
         })?;
         let cookie_preview: String = cookie_line.chars().take(16).collect();
         tracing::debug!(
-            username = %username_line,
+            username = %username_label,
             cookie_len = cookie_line.len(),
             cookie_preview = %cookie_preview,
             socket = %self.socket_path.display(),
+            protocol = "socket-activated-cookie-only",
             "Connected to polkit helper socket"
         );
-        if username_line.len() != username.len() || cookie_line.len() != cookie.len() {
+        if username_label.len() != username.len() || cookie_line.len() != cookie.len() {
             tracing::debug!(
                 original_username_len = username.len(),
-                normalized_username_len = username_line.len(),
+                normalized_username_len = username_label.len(),
                 original_cookie_len = cookie.len(),
                 normalized_cookie_len = cookie_line.len(),
                 "Normalized helper auth control lines before send"
@@ -107,7 +108,8 @@ impl HelperSocketClient {
             .context("failed to clone helper socket stream")?;
         let mut reader = BufReader::new(read_stream);
 
-        write_line(&mut stream, &username_line).context("failed to send helper username")?;
+        // socket-activated polkit helper resolves identity from peer credentials.
+        // It expects only the cookie line from the agent protocol stream.
         write_line(&mut stream, &cookie_line).context("failed to send helper cookie")?;
 
         loop {
@@ -395,8 +397,6 @@ mod tests {
             let read_stream = stream.try_clone().expect("clone");
             let mut reader = BufReader::new(read_stream);
 
-            let mut username = String::new();
-            reader.read_line(&mut username).expect("read username");
             let mut cookie = String::new();
             reader.read_line(&mut cookie).expect("read cookie");
 
@@ -410,7 +410,6 @@ mod tests {
 
             {
                 let mut lines = transcript_for_thread.lock().expect("lock transcript");
-                lines.push(username.trim().to_string());
                 lines.push(cookie.trim().to_string());
                 lines.push(secret.trim().to_string());
             }
@@ -434,7 +433,7 @@ mod tests {
         server.join().expect("server join");
 
         let lines = transcript.lock().expect("lock transcript");
-        assert_eq!(lines.as_slice(), ["alice", "cookie-123", "correct horse"]);
+        assert_eq!(lines.as_slice(), ["cookie-123", "correct horse"]);
 
         let _ = std::fs::remove_file(&socket_path);
     }
@@ -449,8 +448,6 @@ mod tests {
             let read_stream = stream.try_clone().expect("clone");
             let mut reader = BufReader::new(read_stream);
 
-            let mut username = String::new();
-            reader.read_line(&mut username).expect("read username");
             let mut cookie = String::new();
             reader.read_line(&mut cookie).expect("read cookie");
 
