@@ -43,12 +43,22 @@ struct PromptArgs {
     /// Prompt timeout in seconds
     #[arg(long, default_value_t = 120)]
     timeout_secs: u64,
+    /// Visual prompt tone
+    #[arg(long, value_enum, default_value_t = PromptToneArg::Default)]
+    tone: PromptToneArg,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum PromptModeArg {
     Secret,
     Plain,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PromptToneArg {
+    Default,
+    Success,
+    Error,
 }
 
 #[tokio::main]
@@ -70,6 +80,11 @@ async fn main() -> Result<()> {
                     PromptModeArg::Plain => prompt_ui::PromptMode::Plain,
                 },
                 timeout_secs: args.timeout_secs,
+                tone: match args.tone {
+                    PromptToneArg::Default => prompt_ui::PromptTone::Default,
+                    PromptToneArg::Success => prompt_ui::PromptTone::Success,
+                    PromptToneArg::Error => prompt_ui::PromptTone::Error,
+                },
             };
 
             let outcome = match prompt_ui::run_prompt_dialog(request) {

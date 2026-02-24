@@ -11,7 +11,7 @@
 3. `./examples/validate-sprint-04-runtime.sh` (executed with `polkit` backend)
 
 ## Results
-1. Workspace tests passed (`39` garcard tests + workspace crates).
+1. Workspace tests passed (`41` garcard tests + workspace crates).
 2. `validate-sprint-04.sh` passed baseline and restart loop checks:
    - daemon reachable via `ping`/`status`
    - restart loop completed (`3` stop/start iterations)
@@ -25,12 +25,18 @@
    - auth request reached active processing before interruption
    - daemon shutdown/termination unregistered cleanly
    - relaunch succeeded with healthy `status` and `auth-summary`
+6. Acceptance behavior update (2026-02-24):
+   - wrong-password path verified (`auth-summary: failure`)
+   - cancel path verified (`auth-summary: canceled`)
+   - retry-on-failure logic verified with live logs (`attempt=1..3`, `Authentication denied; retrying`)
 
 ## Hardening Outcomes Confirmed
 1. IPC control path now validates same-UID peer credentials.
 2. Prompt UI runtime path no longer relies on panic/`expect` for color parsing.
 3. Helper response buffers are scrubbed after sending to helper socket.
 4. Prompt input handling now moves submitted secrets without cloning and scrubs prompt/output buffers after use.
+5. Prompt feedback tones are wired for auth outcomes (success/error), with error flash behavior in built-in prompt mode.
+6. Failed auth now retries automatically (default `GARCARD_AUTH_MAX_ATTEMPTS=3`).
 
 ## Remaining Manual Sprint 04 Checks
-1. Optional interactive acceptance pass (enter valid credentials, wrong-then-retry, explicit cancel) in full desktop session.
+1. Final interactive success confirmation in desktop session (correct password should return `pkcheck` exit `0` and show success feedback).

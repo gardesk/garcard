@@ -41,6 +41,14 @@ pub trait PromptProvider {
     fn show_info(&mut self, _message: &str) -> Result<()> {
         Ok(())
     }
+
+    fn auth_succeeded(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn auth_failed(&mut self, _message: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -92,7 +100,17 @@ impl HelperSocketClient {
                 anyhow::bail!("helper closed connection unexpectedly");
             }
 
-            match parse_helper_line(&line)? {
+            let event = match parse_helper_line(&line) {
+                Ok(event) => event,
+                Err(err) => {
+                    prompts
+                        .show_error(&err.to_string())
+                        .context("prompt error callback failed")?;
+                    continue;
+                }
+            };
+
+            match event {
                 HelperEvent::PromptHidden(prompt) => {
                     match prompts
                         .prompt_secret(&prompt)
@@ -135,8 +153,18 @@ impl HelperSocketClient {
                         .show_info(&message)
                         .context("prompt info callback failed")?;
                 }
-                HelperEvent::Success => return Ok(HelperOutcome::Authorized),
-                HelperEvent::Failure => return Ok(HelperOutcome::Denied),
+                HelperEvent::Success => {
+                    prompts
+                        .auth_succeeded()
+                        .context("prompt success callback failed")?;
+                    return Ok(HelperOutcome::Authorized);
+                }
+                HelperEvent::Failure => {
+                    prompts
+                        .auth_failed("Authentication failed")
+                        .context("prompt failure callback failed")?;
+                    return Ok(HelperOutcome::Denied);
+                }
             }
         }
     }

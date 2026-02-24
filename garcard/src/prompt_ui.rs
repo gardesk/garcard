@@ -11,6 +11,7 @@ use x11rb::protocol::xproto::ConnectionExt;
 const DIALOG_WIDTH: u32 = 560;
 const DIALOG_HEIGHT: u32 = 240;
 const CARD_PADDING: i32 = 18;
+const ERROR_BLINK_INTERVAL: Duration = Duration::from_millis(180);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptMode {
@@ -18,11 +19,19 @@ pub enum PromptMode {
     Plain,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptTone {
+    Default,
+    Success,
+    Error,
+}
+
 #[derive(Debug, Clone)]
 pub struct PromptRequest {
     pub message: String,
     pub mode: PromptMode,
     pub timeout_secs: u64,
+    pub tone: PromptTone,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +55,10 @@ struct PromptDialog {
     card_background: Color,
     card_border: Color,
     accent: Color,
+    success: Color,
+    error: Color,
+    error_blink_on: bool,
+    last_blink_toggle: Instant,
 }
 
 pub fn run_prompt_dialog(request: PromptRequest) -> Result<PromptExit> {
@@ -94,6 +107,8 @@ impl PromptDialog {
             Color::from_hex("#111318").context("invalid prompt card background color")?;
         let card_border = Color::from_hex("#2c3442").context("invalid prompt card border color")?;
         let accent = Color::from_hex("#8ab4f8").context("invalid prompt accent color")?;
+        let success = Color::from_hex("#41c87a").context("invalid prompt success color")?;
+        let error = Color::from_hex("#ff5f6d").context("invalid prompt error color")?;
         let size = window.size();
         let renderer = Renderer::with_theme(size.width, size.height, theme)?;
 
@@ -123,6 +138,10 @@ impl PromptDialog {
             card_background,
             card_border,
             accent,
+            success,
+            error,
+            error_blink_on: true,
+            last_blink_toggle: Instant::now(),
         })
     }
 
@@ -170,8 +189,17 @@ impl PromptDialog {
     }
 
     fn refresh_timeout(&mut self) -> bool {
+        let mut changed = false;
+
         let Some(deadline) = self.deadline else {
-            return false;
+            if self.request.tone == PromptTone::Error
+                && Instant::now().duration_since(self.last_blink_toggle) >= ERROR_BLINK_INTERVAL
+            {
+                self.last_blink_toggle = Instant::now();
+                self.error_blink_on = !self.error_blink_on;
+                changed = true;
+            }
+            return changed;
         };
 
         let now = Instant::now();
@@ -183,13 +211,31 @@ impl PromptDialog {
         let remaining = deadline.duration_since(now).as_secs();
         if self.remaining_secs != Some(remaining) {
             self.remaining_secs = Some(remaining);
-            return true;
+            changed = true;
         }
 
-        false
+        if self.request.tone == PromptTone::Error
+            && now.duration_since(self.last_blink_toggle) >= ERROR_BLINK_INTERVAL
+        {
+            self.last_blink_toggle = now;
+            self.error_blink_on = !self.error_blink_on;
+            changed = true;
+        }
+
+        changed
     }
 
     fn handle_key(&mut self, key_event: &KeyEvent) {
+        if self.request.tone != PromptTone::Default {
+            match key_event.key {
+                Key::Escape | Key::Return => {
+                    self.exit = Some(PromptExit::Canceled);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key_event.key {
             Key::Escape => {
                 self.exit = Some(PromptExit::Canceled);
@@ -249,6 +295,17 @@ impl PromptDialog {
         let width = size.width as i32;
         let height = size.height as i32;
         let theme = self.renderer.theme().clone();
+        let accent = match self.request.tone {
+            PromptTone::Default => self.accent,
+            PromptTone::Success => self.success,
+            PromptTone::Error => {
+                if self.error_blink_on {
+                    self.error
+                } else {
+                    self.card_border
+                }
+            }
+        };
 
         self.renderer.clear_color(self.backdrop)?;
 
@@ -312,7 +369,7 @@ impl PromptDialog {
         self.renderer
             .fill_rounded_rect(input_rect, 8.0, theme.input_background)?;
         self.renderer
-            .stroke_rounded_rect(input_rect, 8.0, self.accent.with_alpha(0.7), 1.5)?;
+            .stroke_rounded_rect(input_rect, 8.0, accent.with_alpha(0.7), 1.5)?;
 
         let display_input = display_value(&self.input, self.request.mode);
         let input_style = TextStyle::new()
@@ -325,19 +382,26 @@ impl PromptDialog {
             .text(&display_input, input_x as f64, input_y as f64, &input_style)?;
 
         let cursor_prefix = display_prefix(&self.input, self.cursor, self.request.mode);
-        let cursor_size = self.renderer.measure_text(&cursor_prefix, &input_style)?;
-        let cursor_x = input_x + cursor_size.width as i32;
-        self.renderer.fill_rect(
-            Rect::new(cursor_x, input_rect.y + 8, 2, input_rect.height - 16),
-            self.accent,
-        )?;
+        if self.request.tone == PromptTone::Default {
+            let cursor_size = self.renderer.measure_text(&cursor_prefix, &input_style)?;
+            let cursor_x = input_x + cursor_size.width as i32;
+            self.renderer.fill_rect(
+                Rect::new(cursor_x, input_rect.y + 8, 2, input_rect.height - 16),
+                accent,
+            )?;
+        }
 
         let footer_style = TextStyle::new()
             .font_family(theme.font_family)
             .font_size(12.0)
             .color(theme.item_description);
+        let footer_text = if self.request.tone == PromptTone::Default {
+            "Enter submit   Esc cancel"
+        } else {
+            "Esc dismiss"
+        };
         self.renderer.text(
-            "Enter submit   Esc cancel",
+            footer_text,
             (CARD_PADDING + 16) as f64,
             (height - CARD_PADDING - 26) as f64,
             &footer_style,
@@ -348,7 +412,7 @@ impl PromptDialog {
             let timer_style = TextStyle::new()
                 .font_family("Sans")
                 .font_size(12.0)
-                .color(self.accent);
+                .color(accent);
             let timer_size = self.renderer.measure_text(&timer_text, &timer_style)?;
             self.renderer.text(
                 &timer_text,

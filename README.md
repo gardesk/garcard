@@ -35,6 +35,7 @@ Environment overrides:
 8. `GARCARD_PROMPT_COMMAND`
 9. `GARCARD_PROMPT_TIMEOUT_SECS`
 10. `GARCARD_BACKEND_HEALTHCHECK_SECS`
+11. `GARCARD_AUTH_MAX_ATTEMPTS`
 
 Default scaffold file for packaging/integration: `config/garcard/config.toml`
 

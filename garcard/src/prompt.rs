@@ -3,6 +3,24 @@ use anyhow::{Context, Result};
 use std::process::{Command, ExitStatus};
 
 const DEFAULT_ASK_TIMEOUT_SECS: u64 = 120;
+const FEEDBACK_TIMEOUT_SECS: u64 = 1;
+
+#[derive(Debug, Clone, Copy)]
+enum PromptTone {
+    Default,
+    Success,
+    Error,
+}
+
+impl PromptTone {
+    fn as_arg(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Success => "success",
+            Self::Error => "error",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CommandPrompt {
@@ -55,11 +73,26 @@ impl PromptProvider for CommandPrompt {
 
     fn show_error(&mut self, message: &str) -> Result<()> {
         tracing::warn!("polkit helper message: {}", message);
+        let _ = run_feedback_prompt_subcommand(message, PromptTone::Error, FEEDBACK_TIMEOUT_SECS);
         Ok(())
     }
 
     fn show_info(&mut self, message: &str) -> Result<()> {
         tracing::info!("polkit helper message: {}", message);
+        Ok(())
+    }
+
+    fn auth_succeeded(&mut self) -> Result<()> {
+        let _ = run_feedback_prompt_subcommand(
+            "Authentication succeeded",
+            PromptTone::Success,
+            FEEDBACK_TIMEOUT_SECS,
+        );
+        Ok(())
+    }
+
+    fn auth_failed(&mut self, message: &str) -> Result<()> {
+        let _ = run_feedback_prompt_subcommand(message, PromptTone::Error, FEEDBACK_TIMEOUT_SECS);
         Ok(())
     }
 }
@@ -95,6 +128,8 @@ fn run_gartk_prompt_subcommand(
         .arg(prompt)
         .arg("--timeout-secs")
         .arg(timeout_secs.to_string())
+        .arg("--tone")
+        .arg(PromptTone::Default.as_arg())
         .output()
         .context("failed to launch garcard prompt subcommand")?;
 
@@ -109,6 +144,28 @@ fn run_gartk_prompt_subcommand(
     scrub_bytes(&mut output.stdout);
     scrub_bytes(&mut output.stderr);
     Ok(response)
+}
+
+fn run_feedback_prompt_subcommand(
+    message: &str,
+    tone: PromptTone,
+    timeout_secs: u64,
+) -> Result<()> {
+    let executable =
+        std::env::current_exe().context("failed to resolve current executable path")?;
+    let _output = Command::new(executable)
+        .arg("prompt")
+        .arg("--mode")
+        .arg("plain")
+        .arg("--message")
+        .arg(message)
+        .arg("--timeout-secs")
+        .arg(timeout_secs.to_string())
+        .arg("--tone")
+        .arg(tone.as_arg())
+        .output()
+        .context("failed to launch feedback prompt subcommand")?;
+    Ok(())
 }
 
 fn run_systemd_ask_password(
