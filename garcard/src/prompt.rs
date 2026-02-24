@@ -4,9 +4,11 @@ use crate::prompt_ui::{
 };
 use anyhow::{Context, Result};
 use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant};
 
 const DEFAULT_ASK_TIMEOUT_SECS: u64 = 120;
 const FEEDBACK_TIMEOUT_SECS: u64 = 1;
+const RAPID_CANCEL_THRESHOLD: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, Copy)]
 enum PromptTone {
@@ -53,12 +55,14 @@ impl Default for CommandPrompt {
 impl CommandPrompt {
     fn run_prompt(&mut self, prompt: &str, visible: bool) -> Result<PromptResponse> {
         if let Some(command) = self.prompt_command.as_deref() {
+            tracing::debug!(visible, "Using custom prompt command backend");
             return run_custom_prompt_command(command, prompt, visible);
         }
 
         let timeout_secs = self.prompt_timeout_secs;
         let session_result = match self.ensure_session() {
             Some(session) => {
+                tracing::debug!(visible, "Using persistent prompt session backend");
                 let request = PromptRequest {
                     message: prompt.to_string(),
                     mode: if visible {
@@ -69,15 +73,27 @@ impl CommandPrompt {
                     timeout_secs,
                     tone: UiPromptTone::Default,
                 };
-                Some(session.run(request))
+                let started = Instant::now();
+                Some((session.run(request), started.elapsed()))
             }
             None => None,
         };
 
-        if let Some(result) = session_result {
+        if let Some((result, elapsed)) = session_result {
             match result {
                 Ok(PromptExit::Submitted(value)) => return Ok(PromptResponse::Submitted(value)),
-                Ok(PromptExit::Canceled) => return Ok(PromptResponse::Canceled),
+                Ok(PromptExit::Canceled) => {
+                    if elapsed < RAPID_CANCEL_THRESHOLD {
+                        tracing::warn!(
+                            elapsed_ms = elapsed.as_millis(),
+                            "Persistent prompt session canceled immediately; falling back to subprocess prompt"
+                        );
+                        self.session = None;
+                        self.session_unavailable = true;
+                    } else {
+                        return Ok(PromptResponse::Canceled);
+                    }
+                }
                 Ok(PromptExit::TimedOut) => return Ok(PromptResponse::TimedOut),
                 Err(err) => {
                     tracing::warn!(
@@ -91,7 +107,10 @@ impl CommandPrompt {
         }
 
         match run_gartk_prompt_subcommand(prompt, visible, timeout_secs) {
-            Ok(response) => Ok(response),
+            Ok(response) => {
+                tracing::debug!(visible, response = ?response, "Prompt subprocess completed");
+                Ok(response)
+            }
             Err(err) => {
                 tracing::warn!(
                     error = %err,
@@ -228,6 +247,14 @@ fn run_gartk_prompt_subcommand(
         scrub_bytes(&mut output.stderr);
         anyhow::bail!("garcard prompt subcommand unavailable: {}", stderr);
     }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        tracing::debug!(
+            code = ?output.status.code(),
+            stderr = %stderr,
+            "Prompt subprocess exited non-success"
+        );
+    }
 
     let response = map_output_to_prompt_response(&output.status, &output.stdout);
     scrub_bytes(&mut output.stdout);
@@ -274,6 +301,14 @@ fn run_systemd_ask_password(
     let mut output = command
         .output()
         .context("failed to run systemd-ask-password")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        tracing::debug!(
+            code = ?output.status.code(),
+            stderr = %stderr,
+            "systemd-ask-password exited non-success"
+        );
+    }
     let response = map_output_to_prompt_response(&output.status, &output.stdout);
     scrub_bytes(&mut output.stdout);
     scrub_bytes(&mut output.stderr);
