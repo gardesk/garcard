@@ -50,6 +50,7 @@ pub struct PolkitBackendConfig {
 
 type Subject = (String, HashMap<String, OwnedValue>);
 type Details = HashMap<String, String>;
+const DEFAULT_AUTH_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Debug)]
 struct AuthRequest {
@@ -252,27 +253,50 @@ impl PolkitRuntime {
         } else {
             request.message.as_str()
         };
+        let max_attempts = auth_max_attempts();
 
         let mut prompts = CommandPrompt::default();
-        tracing::info!(
-            context = %prompt_context,
-            "Starting helper authentication dialog"
-        );
+        for attempt in 1..=max_attempts {
+            tracing::info!(
+                context = %prompt_context,
+                attempt,
+                max_attempts,
+                "Starting helper authentication dialog"
+            );
 
-        match self
-            .helper_client
-            .authenticate(&request.username, &request.cookie, &mut prompts)
-        {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                tracing::warn!(
-                    action_id = %request.action_id,
-                    error = %err,
-                    "Polkit helper authentication failed"
-                );
-                HelperOutcome::Denied
+            match self
+                .helper_client
+                .authenticate(&request.username, &request.cookie, &mut prompts)
+            {
+                Ok(HelperOutcome::Denied) if attempt < max_attempts => {
+                    self.auth_state.set_phase(AuthPhase::PendingPrompt);
+                    tracing::warn!(
+                        action_id = %request.action_id,
+                        attempt,
+                        max_attempts,
+                        "Authentication denied; retrying prompt"
+                    );
+                    continue;
+                }
+                Ok(outcome) => return outcome,
+                Err(err) => {
+                    tracing::warn!(
+                        action_id = %request.action_id,
+                        attempt,
+                        max_attempts,
+                        error = %err,
+                        "Polkit helper authentication failed"
+                    );
+                    if attempt < max_attempts {
+                        self.auth_state.set_phase(AuthPhase::PendingPrompt);
+                        continue;
+                    }
+                    return HelperOutcome::Denied;
+                }
             }
         }
+
+        HelperOutcome::Denied
     }
 
     fn complete_request(&self, cookie: &str, outcome: HelperOutcome) {
@@ -755,6 +779,14 @@ fn process_start_time_ticks() -> Option<u64> {
     let (_head, tail) = stat.rsplit_once(") ")?;
     let mut fields = tail.split_whitespace();
     fields.nth(19)?.parse::<u64>().ok()
+}
+
+fn auth_max_attempts() -> usize {
+    std::env::var("GARCARD_AUTH_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_AUTH_MAX_ATTEMPTS)
 }
 
 #[cfg(test)]
