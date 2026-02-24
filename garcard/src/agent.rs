@@ -11,8 +11,6 @@ use zbus::blocking::{Connection, Proxy};
 use zbus::fdo;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
-const DEFAULT_AUTH_MAX_ATTEMPTS: usize = 3;
-
 /// Backend interface for Polkit agent integration.
 pub trait AuthAgentBackend {
     fn name(&self) -> &'static str;
@@ -242,55 +240,32 @@ impl PolkitRuntime {
     }
 
     fn authenticate_active_request(&self, request: &ActiveRequest) -> HelperOutcome {
-        let max_attempts = auth_max_attempts();
         let prompt_context = if request.message.is_empty() {
             request.action_id.as_str()
         } else {
             request.message.as_str()
         };
 
-        for attempt in 1..=max_attempts {
-            let mut prompts = CommandPrompt::default();
-            tracing::info!(
-                context = %prompt_context,
-                attempt,
-                max_attempts,
-                "Starting helper authentication dialog"
-            );
+        let mut prompts = CommandPrompt::default();
+        tracing::info!(
+            context = %prompt_context,
+            "Starting helper authentication dialog"
+        );
 
-            let outcome = match self.helper_client.authenticate(
-                &request.username,
-                &request.cookie,
-                &mut prompts,
-            ) {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    tracing::warn!(
-                        action_id = %request.action_id,
-                        attempt,
-                        max_attempts,
-                        error = %err,
-                        "Polkit helper authentication failed"
-                    );
-                    HelperOutcome::Denied
-                }
-            };
-
-            if matches!(outcome, HelperOutcome::Denied) && attempt < max_attempts {
-                self.auth_state.set_phase(AuthPhase::PendingPrompt);
+        match self
+            .helper_client
+            .authenticate(&request.username, &request.cookie, &mut prompts)
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
                 tracing::warn!(
                     action_id = %request.action_id,
-                    attempt,
-                    max_attempts,
-                    "Authentication denied; retrying"
+                    error = %err,
+                    "Polkit helper authentication failed"
                 );
-                continue;
+                HelperOutcome::Denied
             }
-
-            return outcome;
         }
-
-        HelperOutcome::Denied
     }
 
     fn complete_request(&self, cookie: &str, outcome: HelperOutcome) {
@@ -386,14 +361,6 @@ fn username_for_uid(uid: u32) -> Option<String> {
 
 fn current_username() -> Option<String> {
     username_for_uid(nix::unistd::geteuid().as_raw())
-}
-
-fn auth_max_attempts() -> usize {
-    std::env::var("GARCARD_AUTH_MAX_ATTEMPTS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_AUTH_MAX_ATTEMPTS)
 }
 
 #[derive(Debug, Clone)]

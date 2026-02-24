@@ -1,4 +1,7 @@
 use crate::polkit_helper::{PromptProvider, PromptResponse};
+use crate::prompt_ui::{
+    PromptExit, PromptMode, PromptRequest, PromptSession, PromptTone as UiPromptTone,
+};
 use anyhow::{Context, Result};
 use std::process::{Command, ExitStatus};
 
@@ -22,10 +25,12 @@ impl PromptTone {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CommandPrompt {
     prompt_command: Option<String>,
     prompt_timeout_secs: u64,
+    session: Option<PromptSession>,
+    session_unavailable: bool,
 }
 
 impl Default for CommandPrompt {
@@ -39,26 +44,109 @@ impl Default for CommandPrompt {
         Self {
             prompt_command: std::env::var("GARCARD_PROMPT_COMMAND").ok(),
             prompt_timeout_secs,
+            session: None,
+            session_unavailable: false,
         }
     }
 }
 
 impl CommandPrompt {
-    fn run_prompt(&self, prompt: &str, visible: bool) -> Result<PromptResponse> {
+    fn run_prompt(&mut self, prompt: &str, visible: bool) -> Result<PromptResponse> {
         if let Some(command) = self.prompt_command.as_deref() {
             return run_custom_prompt_command(command, prompt, visible);
         }
 
-        match run_gartk_prompt_subcommand(prompt, visible, self.prompt_timeout_secs) {
+        let timeout_secs = self.prompt_timeout_secs;
+        let session_result = match self.ensure_session() {
+            Some(session) => {
+                let request = PromptRequest {
+                    message: prompt.to_string(),
+                    mode: if visible {
+                        PromptMode::Plain
+                    } else {
+                        PromptMode::Secret
+                    },
+                    timeout_secs,
+                    tone: UiPromptTone::Default,
+                };
+                Some(session.run(request))
+            }
+            None => None,
+        };
+
+        if let Some(result) = session_result {
+            match result {
+                Ok(PromptExit::Submitted(value)) => return Ok(PromptResponse::Submitted(value)),
+                Ok(PromptExit::Canceled) => return Ok(PromptResponse::Canceled),
+                Ok(PromptExit::TimedOut) => return Ok(PromptResponse::TimedOut),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "Persistent prompt session failed; falling back to subprocess prompt"
+                    );
+                    self.session = None;
+                    self.session_unavailable = true;
+                }
+            }
+        }
+
+        match run_gartk_prompt_subcommand(prompt, visible, timeout_secs) {
             Ok(response) => Ok(response),
             Err(err) => {
                 tracing::warn!(
                     error = %err,
                     "Failed to run built-in gartk prompt; falling back to systemd-ask-password"
                 );
-                run_systemd_ask_password(prompt, visible, self.prompt_timeout_secs)
+                run_systemd_ask_password(prompt, visible, timeout_secs)
             }
         }
+    }
+
+    fn run_feedback(&mut self, message: &str, tone: PromptTone) -> Result<()> {
+        let session_result = match self.ensure_session() {
+            Some(session) => {
+                Some(session.show_feedback(message, to_ui_tone(tone), FEEDBACK_TIMEOUT_SECS))
+            }
+            None => None,
+        };
+
+        if let Some(result) = session_result {
+            if let Err(err) = result {
+                tracing::warn!(
+                    error = %err,
+                    "Persistent prompt feedback failed; falling back to subprocess prompt"
+                );
+                self.session = None;
+                self.session_unavailable = true;
+            } else {
+                return Ok(());
+            }
+        }
+
+        let _ = run_feedback_prompt_subcommand(message, tone, FEEDBACK_TIMEOUT_SECS);
+        Ok(())
+    }
+
+    fn ensure_session(&mut self) -> Option<&mut PromptSession> {
+        if self.prompt_command.is_some() || self.session_unavailable {
+            return None;
+        }
+        if self.session.is_none() {
+            match PromptSession::connect() {
+                Ok(session) => {
+                    self.session = Some(session);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "Built-in persistent prompt unavailable; using subprocess prompt path"
+                    );
+                    self.session_unavailable = true;
+                    return None;
+                }
+            }
+        }
+        self.session.as_mut()
     }
 }
 
@@ -73,7 +161,6 @@ impl PromptProvider for CommandPrompt {
 
     fn show_error(&mut self, message: &str) -> Result<()> {
         tracing::warn!("polkit helper message: {}", message);
-        let _ = run_feedback_prompt_subcommand(message, PromptTone::Error, FEEDBACK_TIMEOUT_SECS);
         Ok(())
     }
 
@@ -83,17 +170,19 @@ impl PromptProvider for CommandPrompt {
     }
 
     fn auth_succeeded(&mut self) -> Result<()> {
-        let _ = run_feedback_prompt_subcommand(
-            "Authentication succeeded",
-            PromptTone::Success,
-            FEEDBACK_TIMEOUT_SECS,
-        );
-        Ok(())
+        self.run_feedback("Authentication succeeded", PromptTone::Success)
     }
 
     fn auth_failed(&mut self, message: &str) -> Result<()> {
-        let _ = run_feedback_prompt_subcommand(message, PromptTone::Error, FEEDBACK_TIMEOUT_SECS);
-        Ok(())
+        self.run_feedback(message, PromptTone::Error)
+    }
+}
+
+fn to_ui_tone(tone: PromptTone) -> UiPromptTone {
+    match tone {
+        PromptTone::Default => UiPromptTone::Default,
+        PromptTone::Success => UiPromptTone::Success,
+        PromptTone::Error => UiPromptTone::Error,
     }
 }
 

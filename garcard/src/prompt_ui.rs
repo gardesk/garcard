@@ -41,6 +41,10 @@ pub enum PromptExit {
     TimedOut,
 }
 
+pub struct PromptSession {
+    dialog: PromptDialog,
+}
+
 struct PromptDialog {
     window: Window,
     renderer: Renderer,
@@ -62,23 +66,127 @@ struct PromptDialog {
 }
 
 pub fn run_prompt_dialog(request: PromptRequest) -> Result<PromptExit> {
-    let conn = Connection::connect(None).context("failed to connect to X11 display")?;
-    let (x, y) = centered_position(&conn, DIALOG_WIDTH, DIALOG_HEIGHT);
-    let window = Window::create(
-        conn.clone(),
-        WindowConfig::dialog()
-            .title("garcard authentication")
-            .class("garcard")
-            .position(x, y)
-            .size(DIALOG_WIDTH, DIALOG_HEIGHT)
-            .transparent(true)
-            .modal(true),
-    )
-    .context("failed to create prompt window")?;
-    window.focus().context("failed to focus prompt window")?;
+    let mut session = PromptSession::connect()?;
+    session.run(request)
+}
 
-    let mut dialog = PromptDialog::new(window, request)?;
-    dialog.run()
+impl PromptSession {
+    pub fn connect() -> Result<Self> {
+        let request = PromptRequest {
+            message: String::new(),
+            mode: PromptMode::Secret,
+            timeout_secs: 0,
+            tone: PromptTone::Default,
+        };
+
+        let conn = Connection::connect(None).context("failed to connect to X11 display")?;
+        let (x, y) = centered_position(&conn, DIALOG_WIDTH, DIALOG_HEIGHT);
+        let window = Window::create(
+            conn.clone(),
+            WindowConfig::dialog()
+                .title("garcard authentication")
+                .class("garcard")
+                .position(x, y)
+                .size(DIALOG_WIDTH, DIALOG_HEIGHT)
+                .transparent(true)
+                .modal(true),
+        )
+        .context("failed to create prompt window")?;
+        window.focus().context("failed to focus prompt window")?;
+
+        let dialog = PromptDialog::new(window, request)?;
+        Ok(Self { dialog })
+    }
+
+    pub fn run(&mut self, request: PromptRequest) -> Result<PromptExit> {
+        self.dialog.run_request(request)
+    }
+
+    pub fn show_feedback(
+        &mut self,
+        message: &str,
+        tone: PromptTone,
+        timeout_secs: u64,
+    ) -> Result<()> {
+        let _ = self.run(PromptRequest {
+            message: message.to_string(),
+            mode: PromptMode::Plain,
+            timeout_secs,
+            tone,
+        })?;
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for PromptSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PromptSession(..)")
+    }
+}
+
+impl PromptDialog {
+    fn run_request(&mut self, request: PromptRequest) -> Result<PromptExit> {
+        self.begin_request(request);
+        self.window
+            .focus()
+            .context("failed to focus prompt window")?;
+
+        let mut event_loop = EventLoop::new(&self.window, EventLoopConfig::default())?;
+        self.refresh_timeout();
+        self.render()?;
+
+        event_loop.run(|ev, event| {
+            match event {
+                InputEvent::Key(key_event) if key_event.pressed => {
+                    self.handle_key(&key_event);
+                    ev.request_redraw();
+                }
+                InputEvent::Resize { width, height } => {
+                    if let Err(err) = self.renderer.resize(width, height) {
+                        tracing::error!(error = %err, "failed to resize prompt renderer");
+                        self.exit = Some(PromptExit::Canceled);
+                    }
+                    ev.request_redraw();
+                }
+                InputEvent::Expose => {
+                    ev.request_redraw();
+                }
+                InputEvent::CloseRequested => {
+                    self.exit = Some(PromptExit::Canceled);
+                }
+                InputEvent::Idle => {
+                    if self.refresh_timeout() {
+                        ev.request_redraw();
+                    }
+                }
+                _ => {}
+            }
+
+            if ev.needs_redraw() {
+                let _ = self.render();
+                ev.redraw_done();
+            }
+
+            Ok(self.exit.is_none())
+        })?;
+
+        Ok(self.exit.take().unwrap_or(PromptExit::Canceled))
+    }
+
+    fn begin_request(&mut self, request: PromptRequest) {
+        scrub_string(&mut self.input);
+        self.cursor = 0;
+        self.request = request;
+        self.exit = None;
+        self.remaining_secs = None;
+        self.error_blink_on = true;
+        self.last_blink_toggle = Instant::now();
+        self.deadline = if self.request.timeout_secs > 0 {
+            Some(Instant::now() + Duration::from_secs(self.request.timeout_secs))
+        } else {
+            None
+        };
+    }
 }
 
 fn centered_position(conn: &Connection, width: u32, height: u32) -> (i32, i32) {
@@ -143,49 +251,6 @@ impl PromptDialog {
             error_blink_on: true,
             last_blink_toggle: Instant::now(),
         })
-    }
-
-    fn run(&mut self) -> Result<PromptExit> {
-        let mut event_loop = EventLoop::new(&self.window, EventLoopConfig::default())?;
-        self.refresh_timeout();
-        self.render()?;
-
-        event_loop.run(|ev, event| {
-            match event {
-                InputEvent::Key(key_event) if key_event.pressed => {
-                    self.handle_key(&key_event);
-                    ev.request_redraw();
-                }
-                InputEvent::Resize { width, height } => {
-                    if let Err(err) = self.renderer.resize(width, height) {
-                        tracing::error!(error = %err, "failed to resize prompt renderer");
-                        self.exit = Some(PromptExit::Canceled);
-                    }
-                    ev.request_redraw();
-                }
-                InputEvent::Expose => {
-                    ev.request_redraw();
-                }
-                InputEvent::CloseRequested => {
-                    self.exit = Some(PromptExit::Canceled);
-                }
-                InputEvent::Idle => {
-                    if self.refresh_timeout() {
-                        ev.request_redraw();
-                    }
-                }
-                _ => {}
-            }
-
-            if ev.needs_redraw() {
-                let _ = self.render();
-                ev.redraw_done();
-            }
-
-            Ok(self.exit.is_none())
-        })?;
-
-        Ok(self.exit.take().unwrap_or(PromptExit::Canceled))
     }
 
     fn refresh_timeout(&mut self) -> bool {

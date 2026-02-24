@@ -35,15 +35,14 @@ Environment overrides:
 8. `GARCARD_PROMPT_COMMAND`
 9. `GARCARD_PROMPT_TIMEOUT_SECS`
 10. `GARCARD_BACKEND_HEALTHCHECK_SECS`
-11. `GARCARD_AUTH_MAX_ATTEMPTS`
 
 Default scaffold file for packaging/integration: `config/garcard/config.toml`
 
 See `examples/config.toml` for a minimal local starter file.
 
 `GARCARD_PROMPT_COMMAND` is optional. If unset, `garcard` runs the built-in
-`garcard prompt` gartk dialog path and falls back to `systemd-ask-password`
-when the X11 prompt backend is unavailable.
+gartk prompt path with a persistent in-process modal session and falls back to
+`systemd-ask-password` when the X11 prompt backend is unavailable.
 
 ## Validation Docs
 1. `examples/sprint-02-validation.md`

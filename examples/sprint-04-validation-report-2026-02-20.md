@@ -28,7 +28,7 @@
 6. Acceptance behavior update (2026-02-24):
    - wrong-password path verified (`auth-summary: failure`)
    - cancel path verified (`auth-summary: canceled`)
-   - retry-on-failure logic verified with live logs (`attempt=1..3`, `Authentication denied; retrying`)
+   - helper diagnostics classification tightened to avoid treating plaintext helper lines as protocol errors
 
 ## Hardening Outcomes Confirmed
 1. IPC control path now validates same-UID peer credentials.
@@ -36,7 +36,7 @@
 3. Helper response buffers are scrubbed after sending to helper socket.
 4. Prompt input handling now moves submitted secrets without cloning and scrubs prompt/output buffers after use.
 5. Prompt feedback tones are wired for auth outcomes (success/error), with error flash behavior in built-in prompt mode.
-6. Failed auth now retries automatically (default `GARCARD_AUTH_MAX_ATTEMPTS=3`).
+6. Built-in prompt reuses a persistent modal so auth failure feedback can flash inline and reprompt without window teardown.
 
 ## Remaining Manual Sprint 04 Checks
 1. Final interactive success confirmation in desktop session (correct password should return `pkcheck` exit `0` and show success feedback).

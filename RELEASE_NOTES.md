@@ -11,8 +11,9 @@
 2. Reduced panic surface in prompt color setup paths.
 3. Best-effort scrubbing of helper prompt response buffers after use.
 4. Reduced prompt credential lifetime by moving submitted input without cloning and scrubbing prompt output buffers.
-5. Added retry-on-denied auth loop (`GARCARD_AUTH_MAX_ATTEMPTS`, default `3`) for repeated prompt attempts.
-6. Added built-in prompt feedback tones for auth success/error visual feedback.
+5. Added built-in prompt feedback tones for auth success/error visual feedback.
+6. Reused the same built-in prompt window across helper callbacks so failed auth can flash and reprompt without tearing down the modal.
+7. Removed daemon-level same-cookie retry loop; retries now follow helper/PAM flow to avoid stale-cookie false failures.
 
 ## Validation Coverage
 1. Sprint 02 live callback and reconnect validation:
