@@ -230,6 +230,12 @@ impl PolkitRuntime {
             .or_else(|| std::env::var("USER").ok())
             .unwrap_or_else(|| "unknown".to_string());
 
+        tracing::debug!(
+            identity_summary = %summarize_identities(&request.identities),
+            selected_username = %username,
+            "Resolved polkit auth identity"
+        );
+
         Some(ActiveRequest {
             action_id: request.action_id.clone(),
             message: request.message.clone(),
@@ -367,8 +373,14 @@ fn parse_uid(value: &OwnedValue) -> Option<u32> {
     if let Ok(uid) = u64::try_from(value) {
         return u32::try_from(uid).ok();
     }
+    if let Ok(uid) = i64::try_from(value) {
+        return u32::try_from(uid).ok();
+    }
     if let Ok(uid) = i32::try_from(value) {
         return u32::try_from(uid).ok();
+    }
+    if let Ok(uid) = <&str>::try_from(value) {
+        return uid.trim().parse::<u32>().ok();
     }
 
     None
@@ -383,6 +395,26 @@ fn username_for_uid(uid: u32) -> Option<String> {
 
 fn current_username() -> Option<String> {
     username_for_uid(nix::unistd::geteuid().as_raw())
+}
+
+fn summarize_identities(identities: &[Subject]) -> String {
+    let mut summary = Vec::new();
+
+    for (kind, details) in identities {
+        let name = identity_name(details).unwrap_or_else(|| "unknown".to_string());
+        let uid = details
+            .get("uid")
+            .and_then(parse_uid)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        summary.push(format!("{}(name={},uid={})", kind, name, uid));
+    }
+
+    if summary.is_empty() {
+        "<none>".to_string()
+    } else {
+        summary.join(",")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -409,6 +441,7 @@ impl PolkitAuthAgentObject {
     ) -> fdo::Result<()> {
         let detail_count = details.len();
         let identity_count = identities.len();
+        let identity_summary = summarize_identities(&identities);
         let request = AuthRequest {
             action_id: action_id.to_string(),
             message: message.to_string(),
@@ -417,6 +450,13 @@ impl PolkitAuthAgentObject {
             cookie: cookie.to_string(),
             identities,
         };
+
+        tracing::debug!(
+            action_id = %action_id,
+            cookie_len = request.cookie.len(),
+            identities = ?request.identities,
+            "Received raw polkit auth callback payload"
+        );
 
         let queue_insert = self
             .runtime
@@ -430,6 +470,7 @@ impl PolkitAuthAgentObject {
                     icon_name = %icon_name,
                     detail_count,
                     identity_count,
+                    identity_summary = %identity_summary,
                     "Started active polkit auth request"
                 );
             }
@@ -440,6 +481,7 @@ impl PolkitAuthAgentObject {
                     detail_count,
                     identity_count,
                     queue_position = position,
+                    identity_summary = %identity_summary,
                     "Queued polkit auth request"
                 );
             }
