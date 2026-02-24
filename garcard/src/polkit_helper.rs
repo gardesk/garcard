@@ -99,6 +99,10 @@ impl HelperSocketClient {
             if bytes == 0 {
                 anyhow::bail!("helper closed connection unexpectedly");
             }
+            tracing::debug!(
+                helper_line = %line.trim_end_matches('\n').trim_end_matches('\r'),
+                "Received helper protocol line"
+            );
 
             let event = match parse_helper_line(&line) {
                 Ok(event) => event,
@@ -211,17 +215,14 @@ pub fn parse_helper_line(raw: &str) -> Result<HelperEvent> {
         return Ok(HelperEvent::Info(message.to_string()));
     }
 
-    // Some helper builds emit plain-text diagnostics instead of PAM_* protocol
-    // lines. Classify known auth failures so callers can present proper retry UX
-    // without treating successful paths as generic errors.
-    let lower = line.to_ascii_lowercase();
-    if lower.contains("pam_authenticate failed")
-        || lower.contains("authentication failure")
-        || lower.contains("no session for cookie")
-    {
-        return Ok(HelperEvent::Failure);
-    }
     if line.starts_with("polkit-agent-helper-1:") {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("pam_authenticate failed")
+            || lower.contains("authentication failure")
+            || lower.contains("no session for cookie")
+        {
+            return Ok(HelperEvent::Error(line.to_string()));
+        }
         return Ok(HelperEvent::Info(line.to_string()));
     }
 
@@ -325,18 +326,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_helper_line_maps_plaintext_failure_diagnostics() {
+    fn parse_helper_line_maps_plaintext_failure_diagnostics_to_error() {
         assert_eq!(
             parse_helper_line(
                 "polkit-agent-helper-1: pam_authenticate failed: Authentication failure"
             )
-            .expect("maps failure"),
-            HelperEvent::Failure
+            .expect("maps error"),
+            HelperEvent::Error(
+                "polkit-agent-helper-1: pam_authenticate failed: Authentication failure"
+                    .to_string()
+            )
         );
         assert_eq!(
             parse_helper_line("polkit-agent-helper-1: error response to PolicyKit daemon: GDBus.Error:org.freedesktop.PolicyKit1.Error.Failed: No session for cookie")
-                .expect("maps cookie failure"),
-            HelperEvent::Failure
+                .expect("maps cookie error"),
+            HelperEvent::Error("polkit-agent-helper-1: error response to PolicyKit daemon: GDBus.Error:org.freedesktop.PolicyKit1.Error.Failed: No session for cookie".to_string())
         );
     }
 

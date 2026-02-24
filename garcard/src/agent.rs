@@ -200,6 +200,7 @@ impl PolkitRuntime {
                 action_id = %active.action_id,
                 icon_name = %active.icon_name,
                 detail_count = active.detail_count,
+                username = %active.username,
                 "Processing polkit auth request"
             );
 
@@ -317,22 +318,43 @@ impl PolkitRuntime {
 }
 
 fn resolve_identity_username(identities: &[Subject]) -> Option<String> {
+    let current = current_username();
+    if let Some(current_name) = current.as_deref() {
+        for (kind, details) in identities {
+            if kind != "unix-user" {
+                continue;
+            }
+
+            if let Some(name) = identity_name(details) {
+                if name == current_name {
+                    return Some(name);
+                }
+            }
+        }
+    }
+
     for (kind, details) in identities {
         if kind != "unix-user" {
             continue;
         }
 
-        if let Some(value) = details.get("name") {
-            if let Ok(name) = <&str>::try_from(value) {
-                return Some(name.to_string());
-            }
+        if let Some(name) = identity_name(details) {
+            return Some(name);
         }
+    }
 
-        if let Some(uid) = details.get("uid").and_then(parse_uid) {
-            if let Some(name) = username_for_uid(uid) {
-                return Some(name);
-            }
+    None
+}
+
+fn identity_name(details: &HashMap<String, OwnedValue>) -> Option<String> {
+    if let Some(value) = details.get("name") {
+        if let Ok(name) = <&str>::try_from(value) {
+            return Some(name.to_string());
         }
+    }
+
+    if let Some(uid) = details.get("uid").and_then(parse_uid) {
+        return username_for_uid(uid);
     }
 
     None
@@ -822,6 +844,26 @@ mod tests {
             OwnedValue::from(nix::unistd::geteuid().as_raw()),
         );
         let identities = vec![("unix-user".to_string(), details)];
+
+        let resolved = resolve_identity_username(&identities);
+        assert_eq!(resolved, current_username());
+    }
+
+    #[test]
+    fn resolve_identity_username_prefers_current_user_name() {
+        let mut first = HashMap::new();
+        first.insert("uid".to_string(), OwnedValue::from(0_u32));
+
+        let mut second = HashMap::new();
+        second.insert(
+            "uid".to_string(),
+            OwnedValue::from(nix::unistd::geteuid().as_raw()),
+        );
+
+        let identities = vec![
+            ("unix-user".to_string(), first),
+            ("unix-user".to_string(), second),
+        ];
 
         let resolved = resolve_identity_username(&identities);
         assert_eq!(resolved, current_username());
