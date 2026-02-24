@@ -14,6 +14,7 @@
 5. Added built-in prompt feedback tones for auth success/error visual feedback.
 6. Reused the same built-in prompt window across helper callbacks so failed auth can flash and reprompt without tearing down the modal.
 7. Removed daemon-level same-cookie retry loop; retries now follow helper/PAM flow to avoid stale-cookie false failures.
+8. Backend maintenance now uses ping-only health checks instead of periodic re-registration to avoid invalidating in-flight auth cookies.
 
 ## Validation Coverage
 1. Sprint 02 live callback and reconnect validation:

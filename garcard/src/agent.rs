@@ -530,13 +530,6 @@ impl PolkitAgent {
         )?;
         Ok(())
     }
-
-    fn is_already_registered_error(err: &anyhow::Error) -> bool {
-        let message = err.to_string().to_ascii_lowercase();
-        message.contains("already exists")
-            || message.contains("already registered")
-            || message.contains("authentication agent already")
-    }
 }
 
 impl AuthAgentBackend for PolkitAgent {
@@ -641,37 +634,7 @@ impl AuthAgentBackend for PolkitAgent {
         let is_healthy = self
             .connection
             .as_ref()
-            .map(|connection| {
-                let ping_ok = Self::ping_authority(connection).is_ok();
-                if !ping_ok {
-                    return false;
-                }
-
-                let reassert = Self::register_with_authority(
-                    connection,
-                    &self.subject,
-                    self.locale.as_str(),
-                    self.object_path.as_str(),
-                );
-                match reassert {
-                    Ok(()) => {
-                        tracing::info!(
-                            backend = self.name(),
-                            "Re-registered polkit auth agent during maintenance"
-                        );
-                        true
-                    }
-                    Err(err) if Self::is_already_registered_error(&err) => true,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            backend = self.name(),
-                            "Failed to re-assert polkit auth agent registration"
-                        );
-                        false
-                    }
-                }
-            })
+            .map(|connection| Self::ping_authority(connection).is_ok())
             .unwrap_or(false);
         if is_healthy {
             return Ok(());
