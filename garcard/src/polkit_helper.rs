@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 pub const DEFAULT_HELPER_SOCKET: &str = "/run/polkit/agent-helper.socket";
 
@@ -113,6 +114,7 @@ impl HelperSocketClient {
         write_line(&mut stream, &username_line).context("failed to send helper username")?;
         write_line(&mut stream, &cookie_line).context("failed to send helper cookie")?;
 
+        let mut saw_no_session_cookie = false;
         loop {
             let mut line = String::new();
             let bytes = reader
@@ -178,6 +180,149 @@ impl HelperSocketClient {
                     }
                 }
                 HelperEvent::Error(message) => {
+                    if message
+                        .to_ascii_lowercase()
+                        .contains("no session for cookie")
+                    {
+                        saw_no_session_cookie = true;
+                    }
+                    prompts
+                        .show_error(&message)
+                        .context("prompt error callback failed")?;
+                }
+                HelperEvent::Info(message) => {
+                    prompts
+                        .show_info(&message)
+                        .context("prompt info callback failed")?;
+                }
+                HelperEvent::Success => {
+                    prompts
+                        .auth_succeeded()
+                        .context("prompt success callback failed")?;
+                    return Ok(HelperOutcome::Authorized);
+                }
+                HelperEvent::Failure => {
+                    if saw_no_session_cookie {
+                        tracing::warn!(
+                            "Socket helper reported no session for cookie; falling back to direct helper process"
+                        );
+                        return self.authenticate_via_helper_process(
+                            &username_line,
+                            &cookie_line,
+                            prompts,
+                        );
+                    }
+                    prompts
+                        .auth_failed("Authentication failed")
+                        .context("prompt failure callback failed")?;
+                    return Ok(HelperOutcome::Denied);
+                }
+            }
+        }
+    }
+
+    fn authenticate_via_helper_process<P: PromptProvider>(
+        &self,
+        username: &str,
+        cookie: &str,
+        prompts: &mut P,
+    ) -> Result<HelperOutcome> {
+        let helper = resolve_direct_helper_path().context(
+            "failed to locate direct polkit helper binary for socket fallback",
+        )?;
+        tracing::info!(
+            helper = %helper.display(),
+            "Starting direct polkit helper fallback process"
+        );
+
+        let mut child = Command::new(&helper)
+            .arg(username)
+            .arg(cookie)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("failed to spawn helper process {}", helper.display()))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .context("failed to capture helper process stdout")?;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to capture helper process stdin")?;
+        let mut reader = BufReader::new(stdout);
+
+        loop {
+            let mut line = String::new();
+            let bytes = reader
+                .read_line(&mut line)
+                .context("failed to read direct helper response line")?;
+            if bytes == 0 {
+                let status = child
+                    .wait()
+                    .context("failed waiting for helper process exit")?;
+                anyhow::bail!("direct helper closed stream unexpectedly (status: {status})");
+            }
+            tracing::debug!(
+                helper_line = %line.trim_end_matches('\n').trim_end_matches('\r'),
+                helper = %helper.display(),
+                "Received direct helper protocol line"
+            );
+
+            let event = match parse_helper_line(&line) {
+                Ok(event) => event,
+                Err(err) => {
+                    prompts
+                        .show_error(&err.to_string())
+                        .context("prompt error callback failed")?;
+                    continue;
+                }
+            };
+
+            match event {
+                HelperEvent::PromptHidden(prompt) => {
+                    match prompts
+                        .prompt_secret(&prompt)
+                        .context("prompt handler failed")?
+                    {
+                        PromptResponse::Submitted(mut response) => {
+                            tracing::debug!(
+                                response_len = response.chars().count(),
+                                "Submitting secret prompt response to direct helper"
+                            );
+                            let mut sanitized = sanitize_response(&response);
+                            write_line(stdin, &sanitized)
+                                .context("failed to send direct helper secret response")?;
+                            scrub_string(&mut sanitized);
+                            scrub_string(&mut response);
+                        }
+                        PromptResponse::Canceled => return Ok(HelperOutcome::Canceled),
+                        PromptResponse::TimedOut => return Ok(HelperOutcome::Timeout),
+                    }
+                }
+                HelperEvent::PromptVisible(prompt) => {
+                    match prompts
+                        .prompt_plain(&prompt)
+                        .context("prompt handler failed")?
+                    {
+                        PromptResponse::Submitted(mut response) => {
+                            tracing::debug!(
+                                response_len = response.chars().count(),
+                                "Submitting visible prompt response to direct helper"
+                            );
+                            let mut sanitized = sanitize_response(&response);
+                            write_line(stdin, &sanitized)
+                                .context("failed to send direct helper visible response")?;
+                            scrub_string(&mut sanitized);
+                            scrub_string(&mut response);
+                        }
+                        PromptResponse::Canceled => return Ok(HelperOutcome::Canceled),
+                        PromptResponse::TimedOut => return Ok(HelperOutcome::Timeout),
+                    }
+                }
+                HelperEvent::Error(message) => {
                     prompts
                         .show_error(&message)
                         .context("prompt error callback failed")?;
@@ -204,7 +349,7 @@ impl HelperSocketClient {
     }
 }
 
-fn write_line(stream: &mut UnixStream, value: &str) -> Result<()> {
+fn write_line(stream: &mut impl Write, value: &str) -> Result<()> {
     stream.write_all(value.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
@@ -217,6 +362,55 @@ fn sanitize_response(raw: &str) -> String {
 
 fn sanitize_control_line(raw: &str) -> String {
     raw.lines().collect::<Vec<_>>().join(" ").trim().to_string()
+}
+
+fn resolve_direct_helper_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("GARCARD_POLKIT_HELPER_BIN") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let static_candidates = [
+        "/run/wrappers/bin/polkit-agent-helper-1",
+        "/usr/lib/polkit-1/polkit-agent-helper-1",
+        "/usr/lib64/polkit-1/polkit-agent-helper-1",
+        "/lib/polkit-1/polkit-agent-helper-1",
+    ];
+    for candidate in static_candidates {
+        let path = PathBuf::from(candidate);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    if let Some(path) = command_in_path("polkit-agent-helper-1") {
+        return Some(path);
+    }
+
+    // NixOS fallback path.
+    if let Ok(entries) = std::fs::read_dir("/nix/store") {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("lib/polkit-1/polkit-agent-helper-1");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn command_in_path(command: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(command);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn scrub_string(value: &mut String) {
