@@ -6,6 +6,7 @@ use gartk_x11::{
     primary_monitor,
 };
 use std::time::{Duration, Instant};
+use x11rb::connection::Connection as X11Connection;
 use x11rb::protocol::xproto::ConnectionExt;
 
 const DIALOG_WIDTH: u32 = 560;
@@ -49,6 +50,7 @@ struct PromptDialog {
     window: Window,
     renderer: Renderer,
     gc: u32,
+    keymap: Option<X11Keymap>,
     request: PromptRequest,
     input: String,
     cursor: usize,
@@ -63,6 +65,81 @@ struct PromptDialog {
     error: Color,
     error_blink_on: bool,
     last_blink_toggle: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct X11Keymap {
+    min_keycode: u8,
+    max_keycode: u8,
+    keysyms_per_keycode: u8,
+    keysyms: Vec<u32>,
+}
+
+impl X11Keymap {
+    fn load(conn: &Connection) -> Result<Self> {
+        let setup = conn.inner().setup();
+        let min_keycode = setup.min_keycode;
+        let max_keycode = setup.max_keycode;
+        let count = max_keycode
+            .saturating_sub(min_keycode)
+            .saturating_add(1);
+        let reply = conn
+            .inner()
+            .get_keyboard_mapping(min_keycode, count)
+            .context("failed to query X11 keyboard mapping")?
+            .reply()
+            .context("failed to read X11 keyboard mapping reply")?;
+        Ok(Self {
+            min_keycode,
+            max_keycode,
+            keysyms_per_keycode: reply.keysyms_per_keycode,
+            keysyms: reply.keysyms,
+        })
+    }
+
+    fn char_for_event(&self, event: &KeyEvent) -> Option<char> {
+        if event.keycode < self.min_keycode || event.keycode > self.max_keycode {
+            return None;
+        }
+        let stride = self.keysyms_per_keycode as usize;
+        if stride == 0 {
+            return None;
+        }
+        let offset = (event.keycode - self.min_keycode) as usize * stride;
+        let symbols = self.keysyms.get(offset..offset + stride)?;
+
+        // Level 0/1 captures the common unshifted/shifted mapping for the active layout.
+        let level = if event.modifiers.shift { 1 } else { 0 };
+        let keysym = symbols
+            .get(level)
+            .copied()
+            .filter(|sym| *sym != 0)
+            .or_else(|| symbols.first().copied())
+            .unwrap_or(0);
+        if keysym == 0 {
+            return None;
+        }
+        let mut ch = keysym_to_char(keysym)?;
+        if ch.is_ascii_alphabetic() {
+            let upper = event.modifiers.shift ^ event.modifiers.caps_lock;
+            ch = if upper {
+                ch.to_ascii_uppercase()
+            } else {
+                ch.to_ascii_lowercase()
+            };
+        }
+        Some(ch)
+    }
+}
+
+fn keysym_to_char(keysym: u32) -> Option<char> {
+    if (0x20..=0x7e).contains(&keysym) || (0xA0..=0xFF).contains(&keysym) {
+        return char::from_u32(keysym);
+    }
+    if (0x0100_0000..=0x0110_FFFF).contains(&keysym) {
+        return char::from_u32(keysym - 0x0100_0000);
+    }
+    None
 }
 
 pub fn run_prompt_dialog(request: PromptRequest) -> Result<PromptExit> {
@@ -221,6 +298,16 @@ impl PromptDialog {
         let renderer = Renderer::with_theme(size.width, size.height, theme)?;
 
         let conn = window.connection();
+        let keymap = match X11Keymap::load(conn) {
+            Ok(keymap) => Some(keymap),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Failed to load X11 keyboard mapping; falling back to toolkit key translation"
+                );
+                None
+            }
+        };
         let gc = conn.generate_id()?;
         conn.inner()
             .create_gc(gc, window.id(), &Default::default())?;
@@ -236,6 +323,7 @@ impl PromptDialog {
             window,
             renderer,
             gc,
+            keymap,
             request,
             input: String::new(),
             cursor: 0,
@@ -339,16 +427,21 @@ impl PromptDialog {
                 }
             }
             Key::Char(ch) => {
-                if ch.is_control() {
-                    return;
-                }
                 if key_event.modifiers.ctrl
                     || key_event.modifiers.alt
                     || key_event.modifiers.super_key
                 {
                     return;
                 }
-                insert_char_at(&mut self.input, self.cursor, ch);
+                let resolved = self
+                    .keymap
+                    .as_ref()
+                    .and_then(|keymap| keymap.char_for_event(key_event))
+                    .unwrap_or(ch);
+                if resolved.is_control() {
+                    return;
+                }
+                insert_char_at(&mut self.input, self.cursor, resolved);
                 self.cursor += 1;
             }
             _ => {}
@@ -597,5 +690,12 @@ mod tests {
         let mut value = "top-secret".to_string();
         scrub_string(&mut value);
         assert!(value.is_empty());
+    }
+
+    #[test]
+    fn keysym_to_char_maps_ascii_and_unicode() {
+        assert_eq!(keysym_to_char('A' as u32), Some('A'));
+        assert_eq!(keysym_to_char(0x0100_03B1), Some('α'));
+        assert_eq!(keysym_to_char(0), None);
     }
 }
