@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 pub const DEFAULT_HELPER_SOCKET: &str = "/run/polkit/agent-helper.socket";
+const HELPER_TRANSPORT_ENV: &str = "GARCARD_POLKIT_HELPER_TRANSPORT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelperOutcome {
@@ -80,6 +81,16 @@ impl HelperSocketClient {
     ) -> Result<HelperOutcome> {
         let username_line = sanitize_control_line(username);
         let cookie_line = sanitize_control_line(cookie);
+        let transport = helper_transport_mode();
+        tracing::debug!(
+            transport = %transport.as_str(),
+            env_key = HELPER_TRANSPORT_ENV,
+            "Selected polkit helper transport mode"
+        );
+        if matches!(transport, HelperTransportMode::Direct) {
+            return self.authenticate_via_helper_process(&username_line, &cookie_line, prompts);
+        }
+
         let mut stream = UnixStream::connect(&self.socket_path).with_context(|| {
             format!(
                 "failed to connect to polkit helper socket at {}",
@@ -411,6 +422,32 @@ fn command_in_path(command: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelperTransportMode {
+    Auto,
+    Direct,
+}
+
+impl HelperTransportMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+fn helper_transport_mode() -> HelperTransportMode {
+    match std::env::var(HELPER_TRANSPORT_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("direct") => HelperTransportMode::Direct,
+        _ => HelperTransportMode::Auto,
+    }
 }
 
 fn scrub_string(value: &mut String) {
