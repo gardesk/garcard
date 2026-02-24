@@ -77,27 +77,38 @@ impl HelperSocketClient {
         cookie: &str,
         prompts: &mut P,
     ) -> Result<HelperOutcome> {
+        let username_line = sanitize_control_line(username);
+        let cookie_line = sanitize_control_line(cookie);
         let mut stream = UnixStream::connect(&self.socket_path).with_context(|| {
             format!(
                 "failed to connect to polkit helper socket at {}",
                 self.socket_path.display()
             )
         })?;
-        let cookie_preview: String = cookie.chars().take(16).collect();
+        let cookie_preview: String = cookie_line.chars().take(16).collect();
         tracing::debug!(
-            username = %username,
-            cookie_len = cookie.len(),
+            username = %username_line,
+            cookie_len = cookie_line.len(),
             cookie_preview = %cookie_preview,
             socket = %self.socket_path.display(),
             "Connected to polkit helper socket"
         );
+        if username_line.len() != username.len() || cookie_line.len() != cookie.len() {
+            tracing::debug!(
+                original_username_len = username.len(),
+                normalized_username_len = username_line.len(),
+                original_cookie_len = cookie.len(),
+                normalized_cookie_len = cookie_line.len(),
+                "Normalized helper auth control lines before send"
+            );
+        }
         let read_stream = stream
             .try_clone()
             .context("failed to clone helper socket stream")?;
         let mut reader = BufReader::new(read_stream);
 
-        write_line(&mut stream, username).context("failed to send helper username")?;
-        write_line(&mut stream, cookie).context("failed to send helper cookie")?;
+        write_line(&mut stream, &username_line).context("failed to send helper username")?;
+        write_line(&mut stream, &cookie_line).context("failed to send helper cookie")?;
 
         loop {
             let mut line = String::new();
@@ -199,6 +210,10 @@ fn write_line(stream: &mut UnixStream, value: &str) -> Result<()> {
 
 fn sanitize_response(raw: &str) -> String {
     raw.lines().collect::<Vec<_>>().join(" ")
+}
+
+fn sanitize_control_line(raw: &str) -> String {
+    raw.lines().collect::<Vec<_>>().join(" ").trim().to_string()
 }
 
 fn scrub_string(value: &mut String) {
