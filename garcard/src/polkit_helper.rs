@@ -83,6 +83,14 @@ impl HelperSocketClient {
                 self.socket_path.display()
             )
         })?;
+        let cookie_preview: String = cookie.chars().take(16).collect();
+        tracing::debug!(
+            username = %username,
+            cookie_len = cookie.len(),
+            cookie_preview = %cookie_preview,
+            socket = %self.socket_path.display(),
+            "Connected to polkit helper socket"
+        );
         let read_stream = stream
             .try_clone()
             .context("failed to clone helper socket stream")?;
@@ -121,6 +129,10 @@ impl HelperSocketClient {
                         .context("prompt handler failed")?
                     {
                         PromptResponse::Submitted(mut response) => {
+                            tracing::debug!(
+                                response_len = response.chars().count(),
+                                "Submitting secret prompt response to helper"
+                            );
                             let mut sanitized = sanitize_response(&response);
                             write_line(&mut stream, &sanitized)
                                 .context("failed to send helper secret response")?;
@@ -137,6 +149,10 @@ impl HelperSocketClient {
                         .context("prompt handler failed")?
                     {
                         PromptResponse::Submitted(mut response) => {
+                            tracing::debug!(
+                                response_len = response.chars().count(),
+                                "Submitting visible prompt response to helper"
+                            );
                             let mut sanitized = sanitize_response(&response);
                             write_line(&mut stream, &sanitized)
                                 .context("failed to send helper visible response")?;
