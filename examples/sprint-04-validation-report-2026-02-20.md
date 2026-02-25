@@ -29,6 +29,11 @@
    - wrong-password path verified (`auth-summary: failure`)
    - cancel path verified (`auth-summary: canceled`)
    - helper diagnostics classification tightened to avoid treating plaintext helper lines as protocol errors
+7. Regression coverage update (2026-02-25):
+   - added helper callback-path tests for explicit `SUCCESS`/`FAILURE` outcomes.
+   - added helper diagnostic-then-success test to guard against false failure signaling on success.
+   - added agent-level mocked retry conversation test (first failure, second success) to verify recoverable in-session retry behavior.
+   - workspace test baseline now includes `51` `garcard` tests.
 
 ## Hardening Outcomes Confirmed
 1. IPC control path now validates same-UID peer credentials.
