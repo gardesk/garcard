@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 
 pub const DEFAULT_HELPER_SOCKET: &str = "/run/polkit/agent-helper.socket";
 const HELPER_TRANSPORT_ENV: &str = "GARCARD_POLKIT_HELPER_TRANSPORT";
+const HELPER_SOCKET_PROTOCOL_ENV: &str = "GARCARD_POLKIT_SOCKET_PROTOCOL";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelperOutcome {
@@ -83,6 +84,7 @@ impl HelperSocketClient {
         let username_line = sanitize_control_line(username);
         let cookie_line = sanitize_control_line(cookie);
         let transport = helper_transport_mode();
+        let protocol = helper_socket_protocol();
         tracing::debug!(
             transport = %transport.as_str(),
             env_key = HELPER_TRANSPORT_ENV,
@@ -114,7 +116,7 @@ impl HelperSocketClient {
             cookie_len = cookie_line.len(),
             cookie_preview = %cookie_preview,
             socket = %self.socket_path.display(),
-            protocol = "socket-activated-username-cookie",
+            protocol = %protocol.as_str(),
             "Connected to polkit helper socket"
         );
         if username_line.len() != username.len() || cookie_line.len() != cookie.len() {
@@ -131,9 +133,9 @@ impl HelperSocketClient {
             .context("failed to clone helper socket stream")?;
         let mut reader = BufReader::new(read_stream);
 
-        // polkit 127 socket-activated helper reads two control lines:
-        // username first, then cookie.
-        write_line(&mut stream, &username_line).context("failed to send helper username")?;
+        if matches!(protocol, HelperSocketProtocol::UsernameCookie) {
+            write_line(&mut stream, &username_line).context("failed to send helper username")?;
+        }
         write_line(&mut stream, &cookie_line).context("failed to send helper cookie")?;
 
         let mut saw_no_session_cookie = false;
@@ -463,6 +465,21 @@ impl HelperTransportMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelperSocketProtocol {
+    CookieOnly,
+    UsernameCookie,
+}
+
+impl HelperSocketProtocol {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CookieOnly => "socket-activated-cookie-only",
+            Self::UsernameCookie => "socket-activated-username-cookie",
+        }
+    }
+}
+
 fn helper_transport_mode() -> HelperTransportMode {
     match std::env::var(HELPER_TRANSPORT_ENV)
         .ok()
@@ -471,6 +488,19 @@ fn helper_transport_mode() -> HelperTransportMode {
     {
         Some("direct") => HelperTransportMode::Direct,
         _ => HelperTransportMode::Auto,
+    }
+}
+
+fn helper_socket_protocol() -> HelperSocketProtocol {
+    match std::env::var(HELPER_SOCKET_PROTOCOL_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("username-cookie") | Some("username_cookie") | Some("usernamecookie") => {
+            HelperSocketProtocol::UsernameCookie
+        }
+        _ => HelperSocketProtocol::CookieOnly,
     }
 }
 
@@ -653,8 +683,6 @@ mod tests {
             let read_stream = stream.try_clone().expect("clone");
             let mut reader = BufReader::new(read_stream);
 
-            let mut username = String::new();
-            reader.read_line(&mut username).expect("read username");
             let mut cookie = String::new();
             reader.read_line(&mut cookie).expect("read cookie");
 
@@ -668,7 +696,6 @@ mod tests {
 
             {
                 let mut lines = transcript_for_thread.lock().expect("lock transcript");
-                lines.push(username.trim().to_string());
                 lines.push(cookie.trim().to_string());
                 lines.push(secret.trim().to_string());
             }
@@ -692,7 +719,7 @@ mod tests {
         server.join().expect("server join");
 
         let lines = transcript.lock().expect("lock transcript");
-        assert_eq!(lines.as_slice(), ["alice", "cookie-123", "correct horse"]);
+        assert_eq!(lines.as_slice(), ["cookie-123", "correct horse"]);
 
         let _ = std::fs::remove_file(&socket_path);
     }
@@ -707,8 +734,6 @@ mod tests {
             let read_stream = stream.try_clone().expect("clone");
             let mut reader = BufReader::new(read_stream);
 
-            let mut username = String::new();
-            reader.read_line(&mut username).expect("read username");
             let mut cookie = String::new();
             reader.read_line(&mut cookie).expect("read cookie");
 

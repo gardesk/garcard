@@ -269,6 +269,7 @@ impl PolkitRuntime {
                 .authenticate(&request.username, &request.cookie, &mut prompts)
             {
                 Ok(HelperOutcome::Denied) if attempt < max_attempts => {
+                    prompts.set_next_prompt_error_tone();
                     self.auth_state.set_phase(AuthPhase::PendingPrompt);
                     tracing::warn!(
                         action_id = %request.action_id,
@@ -288,6 +289,7 @@ impl PolkitRuntime {
                         "Polkit helper authentication failed"
                     );
                     if attempt < max_attempts {
+                        prompts.set_next_prompt_error_tone();
                         self.auth_state.set_phase(AuthPhase::PendingPrompt);
                         continue;
                     }

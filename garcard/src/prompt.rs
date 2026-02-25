@@ -55,6 +55,10 @@ impl Default for CommandPrompt {
 }
 
 impl CommandPrompt {
+    pub fn set_next_prompt_error_tone(&mut self) {
+        self.next_prompt_tone = Some(PromptTone::Error);
+    }
+
     fn run_prompt(&mut self, prompt: &str, visible: bool) -> Result<PromptResponse> {
         let tone = self.next_prompt_tone.take().unwrap_or(PromptTone::Default);
 
@@ -200,7 +204,6 @@ impl PromptProvider for CommandPrompt {
 
     fn auth_failed(&mut self, message: &str) -> Result<()> {
         tracing::warn!("polkit helper message: {}", message);
-        self.next_prompt_tone = Some(PromptTone::Error);
         Ok(())
     }
 }
