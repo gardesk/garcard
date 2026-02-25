@@ -4,7 +4,7 @@ use crate::polkit_helper::{
 use crate::prompt::CommandPrompt;
 use crate::state::{AuthPhase, AuthQueue, AuthState, QueueInsert};
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -70,6 +70,7 @@ struct ActiveRequest {
     message: String,
     icon_name: String,
     detail_count: usize,
+    details: Details,
     cookie: String,
     username: String,
 }
@@ -79,6 +80,7 @@ struct PolkitRuntime {
     auth_state: Arc<AuthState>,
     queue: Mutex<AuthQueue<AuthRequest>>,
     outcomes: Mutex<HashMap<String, HelperOutcome>>,
+    canceled_cookies: Mutex<HashSet<String>>,
     outcome_signal: Condvar,
     helper_client: HelperSocketClient,
     processing: AtomicBool,
@@ -92,6 +94,70 @@ trait RetryPromptProvider: PromptProvider {
 impl RetryPromptProvider for CommandPrompt {
     fn on_retry(&mut self) {
         self.set_next_prompt_error_tone();
+    }
+}
+
+struct CancellationAwarePrompt<'a, P> {
+    inner: &'a mut P,
+    runtime: &'a PolkitRuntime,
+    cookie: &'a str,
+}
+
+impl<'a, P> CancellationAwarePrompt<'a, P> {
+    fn new(inner: &'a mut P, runtime: &'a PolkitRuntime, cookie: &'a str) -> Self {
+        Self {
+            inner,
+            runtime,
+            cookie,
+        }
+    }
+
+    fn canceled(&self) -> bool {
+        self.runtime.is_canceled(self.cookie)
+    }
+}
+
+impl<P: PromptProvider> PromptProvider for CancellationAwarePrompt<'_, P> {
+    fn prompt_secret(&mut self, prompt: &str) -> Result<crate::polkit_helper::PromptResponse> {
+        if self.canceled() {
+            return Ok(crate::polkit_helper::PromptResponse::Canceled);
+        }
+        self.inner.prompt_secret(prompt)
+    }
+
+    fn prompt_plain(&mut self, prompt: &str) -> Result<crate::polkit_helper::PromptResponse> {
+        if self.canceled() {
+            return Ok(crate::polkit_helper::PromptResponse::Canceled);
+        }
+        self.inner.prompt_plain(prompt)
+    }
+
+    fn show_error(&mut self, message: &str) -> Result<()> {
+        if self.canceled() {
+            return Ok(());
+        }
+        self.inner.show_error(message)
+    }
+
+    fn show_info(&mut self, message: &str) -> Result<()> {
+        if self.canceled() {
+            return Ok(());
+        }
+        self.inner.show_info(message)
+    }
+
+    fn auth_succeeded(&mut self) -> Result<()> {
+        if self.canceled() {
+            return Ok(());
+        }
+        self.inner.auth_succeeded()
+    }
+
+    fn auth_failed(&mut self, message: &str) -> Result<()> {
+        if self.canceled() {
+            return Ok(());
+        }
+        self.inner.auth_failed(message)
     }
 }
 
@@ -113,6 +179,7 @@ impl PolkitRuntime {
             auth_state,
             queue: Mutex::new(AuthQueue::default()),
             outcomes: Mutex::new(HashMap::new()),
+            canceled_cookies: Mutex::new(HashSet::new()),
             outcome_signal: Condvar::new(),
             helper_client: HelperSocketClient::new(helper_socket),
             processing: AtomicBool::new(false),
@@ -121,6 +188,7 @@ impl PolkitRuntime {
     }
 
     fn begin_authentication(self: &Arc<Self>, request: AuthRequest) -> Result<QueueInsert> {
+        let cookie = request.cookie.clone();
         let (insert, active, queued) = {
             let mut queue = self
                 .queue
@@ -130,6 +198,7 @@ impl PolkitRuntime {
             let (active, queued) = queue.counts();
             (insert, active, queued)
         };
+        self.clear_canceled(&cookie);
 
         self.auth_state.sync_queue_counts(active, queued);
         if matches!(
@@ -169,6 +238,7 @@ impl PolkitRuntime {
         };
 
         if canceled_active || removed_queued {
+            self.mark_canceled(cookie);
             self.record_outcome(cookie, HelperOutcome::Canceled);
         }
 
@@ -262,6 +332,7 @@ impl PolkitRuntime {
             message: request.message.clone(),
             icon_name: request.icon_name.clone(),
             detail_count: request.details.len(),
+            details: request.details.clone(),
             cookie: request.cookie.clone(),
             username,
         })
@@ -277,14 +348,17 @@ impl PolkitRuntime {
         request: &ActiveRequest,
         prompts: &mut P,
     ) -> HelperOutcome {
-        let prompt_context = if request.message.is_empty() {
-            request.action_id.as_str()
-        } else {
-            request.message.as_str()
-        };
+        let prompt_context = render_prompt_context(request);
         let max_attempts = auth_max_attempts();
 
         for attempt in 1..=max_attempts {
+            if self.is_canceled(&request.cookie) {
+                tracing::info!(
+                    action_id = %request.action_id,
+                    "Authentication request canceled before helper attempt"
+                );
+                return HelperOutcome::Canceled;
+            }
             tracing::info!(
                 context = %prompt_context,
                 attempt,
@@ -292,10 +366,20 @@ impl PolkitRuntime {
                 "Starting helper authentication dialog"
             );
 
-            match self
-                .helper_client
-                .authenticate(&request.username, &request.cookie, prompts)
-            {
+            let mut cancel_aware =
+                CancellationAwarePrompt::new(prompts, self, request.cookie.as_str());
+            match self.helper_client.authenticate(
+                &request.username,
+                &request.cookie,
+                &mut cancel_aware,
+            ) {
+                Ok(outcome) if self.is_canceled(&request.cookie) => {
+                    tracing::info!(
+                        action_id = %request.action_id,
+                        "Authentication request canceled during helper attempt"
+                    );
+                    return HelperOutcome::Canceled;
+                }
                 Ok(HelperOutcome::Denied) if attempt < max_attempts => {
                     prompts.on_retry();
                     self.auth_state.set_phase(AuthPhase::PendingPrompt);
@@ -352,6 +436,7 @@ impl PolkitRuntime {
             }
             return;
         }
+        self.clear_canceled(cookie);
         self.record_outcome(cookie, outcome);
 
         if active > 0 {
@@ -380,6 +465,29 @@ impl PolkitRuntime {
         self.outcome_signal.notify_all();
     }
 
+    fn mark_canceled(&self, cookie: &str) {
+        if let Ok(mut canceled) = self.canceled_cookies.lock() {
+            canceled.insert(cookie.to_string());
+        } else {
+            tracing::error!("auth canceled-cookie set lock poisoned");
+        }
+    }
+
+    fn clear_canceled(&self, cookie: &str) {
+        if let Ok(mut canceled) = self.canceled_cookies.lock() {
+            canceled.remove(cookie);
+        } else {
+            tracing::error!("auth canceled-cookie set lock poisoned");
+        }
+    }
+
+    fn is_canceled(&self, cookie: &str) -> bool {
+        self.canceled_cookies
+            .lock()
+            .map(|canceled| canceled.contains(cookie))
+            .unwrap_or(false)
+    }
+
     fn wait_for_completion(&self, cookie: &str) -> Result<HelperOutcome> {
         let mut outcomes = self
             .outcomes
@@ -403,9 +511,56 @@ impl PolkitRuntime {
         if let Ok(mut outcomes) = self.outcomes.lock() {
             outcomes.clear();
         }
+        if let Ok(mut canceled) = self.canceled_cookies.lock() {
+            canceled.clear();
+        }
         self.processing.store(false, Ordering::Release);
         self.auth_state.set_phase(AuthPhase::Idle);
         self.auth_state.sync_queue_counts(0, 0);
+    }
+}
+
+fn render_prompt_context(request: &ActiveRequest) -> String {
+    let mut lines = Vec::new();
+    let message = request.message.trim();
+    if !message.is_empty() {
+        lines.push(message.to_string());
+    } else {
+        lines.push("Authentication is required".to_string());
+    }
+
+    lines.push(format!("Action: {}", request.action_id));
+    if !request.icon_name.trim().is_empty() {
+        lines.push(format!("Icon: {}", request.icon_name.trim()));
+    }
+
+    let detail_keys = [
+        "program",
+        "command_line",
+        "unit",
+        "verb",
+        "polkit.retains_authorization_after_challenge",
+    ];
+    for key in detail_keys {
+        if let Some(value) = request.details.get(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                lines.push(format!("{}: {}", detail_key_label(key), trimmed));
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn detail_key_label(key: &str) -> &'static str {
+    match key {
+        "program" => "Program",
+        "command_line" => "Command",
+        "unit" => "Unit",
+        "verb" => "Verb",
+        "polkit.retains_authorization_after_challenge" => "Retains authorization",
+        _ => "Detail",
     }
 }
 
@@ -1108,6 +1263,7 @@ mod tests {
             auth_state: Arc::new(AuthState::default()),
             queue: Mutex::new(AuthQueue::default()),
             outcomes: Mutex::new(HashMap::new()),
+            canceled_cookies: Mutex::new(HashSet::new()),
             outcome_signal: Condvar::new(),
             helper_client: HelperSocketClient::new(&socket_path),
             processing: AtomicBool::new(false),
@@ -1118,6 +1274,7 @@ mod tests {
             message: "Authenticate".to_string(),
             icon_name: "dialog-password".to_string(),
             detail_count: 0,
+            details: HashMap::new(),
             cookie: "cookie-1".to_string(),
             username: "alice".to_string(),
         };
@@ -1134,6 +1291,56 @@ mod tests {
 
         server.join().expect("server join");
         let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn render_prompt_context_includes_policy_details() {
+        let mut details = HashMap::new();
+        details.insert("program".to_string(), "/usr/bin/meson".to_string());
+        details.insert("command_line".to_string(), "meson install".to_string());
+        details.insert(
+            "polkit.retains_authorization_after_challenge".to_string(),
+            "1".to_string(),
+        );
+        let request = ActiveRequest {
+            action_id: "com.mesonbuild.install.run".to_string(),
+            message: "Authentication is required to install this project".to_string(),
+            icon_name: "preferences-system".to_string(),
+            detail_count: details.len(),
+            details,
+            cookie: "cookie-ctx".to_string(),
+            username: "alice".to_string(),
+        };
+
+        let context = render_prompt_context(&request);
+        assert!(context.contains("Authentication is required to install this project"));
+        assert!(context.contains("Action: com.mesonbuild.install.run"));
+        assert!(context.contains("Icon: preferences-system"));
+        assert!(context.contains("Program: /usr/bin/meson"));
+        assert!(context.contains("Command: meson install"));
+        assert!(context.contains("Retains authorization: 1"));
+    }
+
+    #[test]
+    fn cancellation_aware_prompt_short_circuits_prompt_and_feedback() {
+        let runtime = PolkitRuntime::new_without_worker(Arc::new(AuthState::default()));
+        runtime.mark_canceled("cookie-1");
+
+        let mut prompts =
+            SequencedPrompt::new(vec![PromptResponse::Submitted("correct horse".to_string())]);
+        {
+            let mut wrapped = CancellationAwarePrompt::new(&mut prompts, &runtime, "cookie-1");
+            let response = wrapped
+                .prompt_secret("Password:")
+                .expect("prompt response should be canceled");
+            assert_eq!(response, PromptResponse::Canceled);
+            wrapped
+                .auth_succeeded()
+                .expect("suppressed success callback");
+        }
+
+        assert_eq!(prompts.prompt_count, 0);
+        assert_eq!(prompts.success_count, 0);
     }
 
     #[test]
