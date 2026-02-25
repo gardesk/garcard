@@ -13,6 +13,7 @@ const DIALOG_WIDTH: u32 = 560;
 const DIALOG_HEIGHT: u32 = 240;
 const CARD_PADDING: i32 = 18;
 const ERROR_BLINK_INTERVAL: Duration = Duration::from_millis(180);
+const RETRY_ERROR_FLASH_DURATION: Duration = Duration::from_millis(900);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptMode {
@@ -66,6 +67,7 @@ struct PromptDialog {
     error: Color,
     error_blink_on: bool,
     last_blink_toggle: Instant,
+    error_flash_until: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +261,12 @@ impl PromptDialog {
         self.remaining_secs = None;
         self.error_blink_on = true;
         self.last_blink_toggle = Instant::now();
+        self.error_flash_until =
+            if !self.request.feedback_only && self.request.tone == PromptTone::Error {
+                Some(Instant::now() + RETRY_ERROR_FLASH_DURATION)
+            } else {
+                None
+            };
         self.deadline = if self.request.timeout_secs > 0 {
             Some(Instant::now() + Duration::from_secs(self.request.timeout_secs))
         } else {
@@ -339,24 +347,33 @@ impl PromptDialog {
             error,
             error_blink_on: true,
             last_blink_toggle: Instant::now(),
+            error_flash_until: None,
         })
     }
 
     fn refresh_timeout(&mut self) -> bool {
         let mut changed = false;
+        let now = Instant::now();
+
+        if let Some(until) = self.error_flash_until {
+            if now >= until {
+                self.error_flash_until = None;
+                self.request.tone = PromptTone::Default;
+                self.error_blink_on = true;
+                changed = true;
+            }
+        }
 
         let Some(deadline) = self.deadline else {
             if self.request.tone == PromptTone::Error
-                && Instant::now().duration_since(self.last_blink_toggle) >= ERROR_BLINK_INTERVAL
+                && now.duration_since(self.last_blink_toggle) >= ERROR_BLINK_INTERVAL
             {
-                self.last_blink_toggle = Instant::now();
+                self.last_blink_toggle = now;
                 self.error_blink_on = !self.error_blink_on;
                 changed = true;
             }
             return changed;
         };
-
-        let now = Instant::now();
         if now >= deadline {
             self.exit = Some(PromptExit::TimedOut);
             return true;

@@ -9,7 +9,7 @@ use std::time::Duration;
 pub const DEFAULT_HELPER_SOCKET: &str = "/run/polkit/agent-helper.socket";
 const HELPER_TRANSPORT_ENV: &str = "GARCARD_POLKIT_HELPER_TRANSPORT";
 const HELPER_SOCKET_PROTOCOL_ENV: &str = "GARCARD_POLKIT_SOCKET_PROTOCOL";
-const SOCKET_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
+const SOCKET_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelperOutcome {
@@ -132,8 +132,8 @@ impl HelperSocketClient {
         prompts: &mut P,
     ) -> Result<HelperOutcome> {
         let protocols = [
-            HelperSocketProtocol::UsernameCookie,
             HelperSocketProtocol::CookieOnly,
+            HelperSocketProtocol::UsernameCookie,
         ];
 
         for protocol in protocols {
