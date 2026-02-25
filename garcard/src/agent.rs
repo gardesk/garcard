@@ -1,4 +1,6 @@
-use crate::polkit_helper::{DEFAULT_HELPER_SOCKET, HelperOutcome, HelperSocketClient};
+use crate::polkit_helper::{
+    DEFAULT_HELPER_SOCKET, HelperOutcome, HelperSocketClient, PromptProvider,
+};
 use crate::prompt::CommandPrompt;
 use crate::state::{AuthPhase, AuthQueue, AuthState, QueueInsert};
 use anyhow::{Context, Result};
@@ -81,6 +83,16 @@ struct PolkitRuntime {
     helper_client: HelperSocketClient,
     processing: AtomicBool,
     worker_enabled: bool,
+}
+
+trait RetryPromptProvider: PromptProvider {
+    fn on_retry(&mut self) {}
+}
+
+impl RetryPromptProvider for CommandPrompt {
+    fn on_retry(&mut self) {
+        self.set_next_prompt_error_tone();
+    }
 }
 
 impl PolkitRuntime {
@@ -256,6 +268,15 @@ impl PolkitRuntime {
     }
 
     fn authenticate_active_request(&self, request: &ActiveRequest) -> HelperOutcome {
+        let mut prompts = CommandPrompt::default();
+        self.authenticate_active_request_with_prompts(request, &mut prompts)
+    }
+
+    fn authenticate_active_request_with_prompts<P: RetryPromptProvider>(
+        &self,
+        request: &ActiveRequest,
+        prompts: &mut P,
+    ) -> HelperOutcome {
         let prompt_context = if request.message.is_empty() {
             request.action_id.as_str()
         } else {
@@ -263,7 +284,6 @@ impl PolkitRuntime {
         };
         let max_attempts = auth_max_attempts();
 
-        let mut prompts = CommandPrompt::default();
         for attempt in 1..=max_attempts {
             tracing::info!(
                 context = %prompt_context,
@@ -274,10 +294,10 @@ impl PolkitRuntime {
 
             match self
                 .helper_client
-                .authenticate(&request.username, &request.cookie, &mut prompts)
+                .authenticate(&request.username, &request.cookie, prompts)
             {
                 Ok(HelperOutcome::Denied) if attempt < max_attempts => {
-                    prompts.set_next_prompt_error_tone();
+                    prompts.on_retry();
                     self.auth_state.set_phase(AuthPhase::PendingPrompt);
                     tracing::warn!(
                         action_id = %request.action_id,
@@ -297,7 +317,7 @@ impl PolkitRuntime {
                         "Polkit helper authentication failed"
                     );
                     if attempt < max_attempts {
-                        prompts.set_next_prompt_error_tone();
+                        prompts.on_retry();
                         self.auth_state.set_phase(AuthPhase::PendingPrompt);
                         continue;
                     }
@@ -846,6 +866,69 @@ fn auth_max_attempts() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::polkit_helper::PromptResponse;
+    use std::collections::VecDeque;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct SequencedPrompt {
+        responses: VecDeque<PromptResponse>,
+        success_count: usize,
+        failure_messages: Vec<String>,
+        prompt_count: usize,
+    }
+
+    impl SequencedPrompt {
+        fn new(responses: Vec<PromptResponse>) -> Self {
+            Self {
+                responses: VecDeque::from(responses),
+                success_count: 0,
+                failure_messages: Vec::new(),
+                prompt_count: 0,
+            }
+        }
+    }
+
+    impl PromptProvider for SequencedPrompt {
+        fn prompt_secret(&mut self, _prompt: &str) -> Result<PromptResponse> {
+            self.prompt_count += 1;
+            Ok(self
+                .responses
+                .pop_front()
+                .unwrap_or(PromptResponse::Canceled))
+        }
+
+        fn prompt_plain(&mut self, _prompt: &str) -> Result<PromptResponse> {
+            self.prompt_secret(_prompt)
+        }
+
+        fn auth_succeeded(&mut self) -> Result<()> {
+            self.success_count += 1;
+            Ok(())
+        }
+
+        fn auth_failed(&mut self, message: &str) -> Result<()> {
+            self.failure_messages.push(message.to_string());
+            Ok(())
+        }
+    }
+
+    impl RetryPromptProvider for SequencedPrompt {}
+
+    fn temp_socket_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "garcard-agent-test-{}-{}.sock",
+            std::process::id(),
+            nanos
+        ))
+    }
 
     fn fake_request(cookie: &str) -> AuthRequest {
         AuthRequest {
@@ -982,6 +1065,75 @@ mod tests {
             .wait_for_completion("cookie-1")
             .expect("wait for completion");
         assert_eq!(outcome, HelperOutcome::Canceled);
+    }
+
+    #[test]
+    fn authenticate_active_request_retries_after_failure_then_succeeds() {
+        let socket_path = temp_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = thread::spawn(move || {
+            for expected_outcome in ["failure", "success"] {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let read_stream = stream.try_clone().expect("clone");
+                let mut reader = BufReader::new(read_stream);
+
+                let mut first_line = String::new();
+                reader.read_line(&mut first_line).expect("read first line");
+                let first = first_line.trim().to_string();
+                if first == "alice" {
+                    let mut cookie = String::new();
+                    reader.read_line(&mut cookie).expect("read cookie");
+                }
+
+                stream
+                    .write_all(b"PAM_PROMPT_ECHO_OFF Password:\n")
+                    .expect("write prompt");
+                stream.flush().expect("flush prompt");
+
+                let mut secret = String::new();
+                reader.read_line(&mut secret).expect("read secret");
+                assert_eq!(secret.trim(), "correct horse");
+
+                if expected_outcome == "failure" {
+                    stream.write_all(b"FAILURE\n").expect("write failure");
+                } else {
+                    stream.write_all(b"SUCCESS\n").expect("write success");
+                }
+                stream.flush().expect("flush result");
+            }
+        });
+
+        let runtime = PolkitRuntime {
+            auth_state: Arc::new(AuthState::default()),
+            queue: Mutex::new(AuthQueue::default()),
+            outcomes: Mutex::new(HashMap::new()),
+            outcome_signal: Condvar::new(),
+            helper_client: HelperSocketClient::new(&socket_path),
+            processing: AtomicBool::new(false),
+            worker_enabled: false,
+        };
+        let active = ActiveRequest {
+            action_id: "org.gardesk.test".to_string(),
+            message: "Authenticate".to_string(),
+            icon_name: "dialog-password".to_string(),
+            detail_count: 0,
+            cookie: "cookie-1".to_string(),
+            username: "alice".to_string(),
+        };
+        let mut prompts = SequencedPrompt::new(vec![
+            PromptResponse::Submitted("correct horse".to_string()),
+            PromptResponse::Submitted("correct horse".to_string()),
+        ]);
+
+        let outcome = runtime.authenticate_active_request_with_prompts(&active, &mut prompts);
+        assert_eq!(outcome, HelperOutcome::Authorized);
+        assert_eq!(prompts.prompt_count, 2);
+        assert_eq!(prompts.success_count, 1);
+        assert_eq!(prompts.failure_messages, vec!["Authentication failed"]);
+
+        server.join().expect("server join");
+        let _ = std::fs::remove_file(&socket_path);
     }
 
     #[test]
