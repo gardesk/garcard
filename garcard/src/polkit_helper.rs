@@ -1,13 +1,15 @@
 use anyhow::{Context, Result};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 pub const DEFAULT_HELPER_SOCKET: &str = "/run/polkit/agent-helper.socket";
 const HELPER_TRANSPORT_ENV: &str = "GARCARD_POLKIT_HELPER_TRANSPORT";
 const HELPER_SOCKET_PROTOCOL_ENV: &str = "GARCARD_POLKIT_SOCKET_PROTOCOL";
+const SOCKET_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelperOutcome {
@@ -84,7 +86,6 @@ impl HelperSocketClient {
         let username_line = sanitize_control_line(username);
         let cookie_line = sanitize_control_line(cookie);
         let transport = helper_transport_mode();
-        let protocol = helper_socket_protocol();
         tracing::debug!(
             transport = %transport.as_str(),
             env_key = HELPER_TRANSPORT_ENV,
@@ -104,6 +105,67 @@ impl HelperSocketClient {
             );
         }
 
+        match helper_socket_protocol() {
+            HelperSocketProtocol::Auto => {
+                self.authenticate_via_socket_auto(&username_line, &cookie_line, prompts)
+            }
+            protocol => {
+                match self.authenticate_via_socket(&username_line, &cookie_line, prompts, protocol)
+                {
+                    Ok(outcome) => Ok(outcome),
+                    Err(err) if is_no_session_cookie_error(&err) => {
+                        prompts
+                            .auth_failed("Authentication failed")
+                            .context("prompt failure callback failed")?;
+                        Ok(HelperOutcome::Denied)
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+        }
+    }
+
+    fn authenticate_via_socket_auto<P: PromptProvider>(
+        &self,
+        username: &str,
+        cookie: &str,
+        prompts: &mut P,
+    ) -> Result<HelperOutcome> {
+        let protocols = [
+            HelperSocketProtocol::UsernameCookie,
+            HelperSocketProtocol::CookieOnly,
+        ];
+
+        for protocol in protocols {
+            match self.authenticate_via_socket(username, cookie, prompts, protocol) {
+                Ok(outcome) => return Ok(outcome),
+                Err(err)
+                    if is_no_session_cookie_error(&err)
+                        || is_no_initial_helper_response_error(&err) =>
+                {
+                    tracing::warn!(
+                        protocol = %protocol.as_str(),
+                        error = %err,
+                        "Socket helper protocol attempt failed; retrying with alternate socket protocol"
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        prompts
+            .auth_failed("Authentication failed")
+            .context("prompt failure callback failed")?;
+        Ok(HelperOutcome::Denied)
+    }
+
+    fn authenticate_via_socket<P: PromptProvider>(
+        &self,
+        username_line: &str,
+        cookie_line: &str,
+        prompts: &mut P,
+        protocol: HelperSocketProtocol,
+    ) -> Result<HelperOutcome> {
         let mut stream = UnixStream::connect(&self.socket_path).with_context(|| {
             format!(
                 "failed to connect to polkit helper socket at {}",
@@ -119,18 +181,10 @@ impl HelperSocketClient {
             protocol = %protocol.as_str(),
             "Connected to polkit helper socket"
         );
-        if username_line.len() != username.len() || cookie_line.len() != cookie.len() {
-            tracing::debug!(
-                original_username_len = username.len(),
-                normalized_username_len = username_line.len(),
-                original_cookie_len = cookie.len(),
-                normalized_cookie_len = cookie_line.len(),
-                "Normalized helper auth control lines before send"
-            );
-        }
         let read_stream = stream
             .try_clone()
             .context("failed to clone helper socket stream")?;
+        let _ = read_stream.set_read_timeout(Some(SOCKET_FIRST_RESPONSE_TIMEOUT));
         let mut reader = BufReader::new(read_stream);
 
         if matches!(protocol, HelperSocketProtocol::UsernameCookie) {
@@ -139,13 +193,29 @@ impl HelperSocketClient {
         write_line(&mut stream, &cookie_line).context("failed to send helper cookie")?;
 
         let mut saw_no_session_cookie = false;
+        let mut saw_first_event = false;
         loop {
             let mut line = String::new();
-            let bytes = reader
-                .read_line(&mut line)
-                .context("failed to read helper response line")?;
+            let bytes = match reader.read_line(&mut line) {
+                Ok(bytes) => bytes,
+                Err(err)
+                    if !saw_first_event
+                        && matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
+                {
+                    return Err(NoInitialHelperResponseError.into());
+                }
+                Err(err) => {
+                    return Err(
+                        anyhow::Error::new(err).context("failed to read helper response line")
+                    );
+                }
+            };
             if bytes == 0 {
                 anyhow::bail!("helper closed connection unexpectedly");
+            }
+            if !saw_first_event {
+                saw_first_event = true;
+                let _ = reader.get_mut().set_read_timeout(None);
             }
             tracing::debug!(
                 helper_line = %line.trim_end_matches('\n').trim_end_matches('\r'),
@@ -239,9 +309,7 @@ impl HelperSocketClient {
                                 prompts,
                             );
                         }
-                        tracing::warn!(
-                            "Socket helper reported no session for cookie and no viable direct helper is available; treating as authentication failure"
-                        );
+                        return Err(NoSessionForCookieError.into());
                     }
                     prompts
                         .auth_failed("Authentication failed")
@@ -378,6 +446,36 @@ impl HelperSocketClient {
     }
 }
 
+#[derive(Debug)]
+struct NoSessionForCookieError;
+
+impl std::fmt::Display for NoSessionForCookieError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("socket helper reported no session for cookie")
+    }
+}
+
+impl std::error::Error for NoSessionForCookieError {}
+
+fn is_no_session_cookie_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NoSessionForCookieError>().is_some()
+}
+
+#[derive(Debug)]
+struct NoInitialHelperResponseError;
+
+impl std::fmt::Display for NoInitialHelperResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("socket helper produced no initial response")
+    }
+}
+
+impl std::error::Error for NoInitialHelperResponseError {}
+
+fn is_no_initial_helper_response_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NoInitialHelperResponseError>().is_some()
+}
+
 fn write_line(stream: &mut impl Write, value: &str) -> Result<()> {
     stream.write_all(value.as_bytes())?;
     stream.write_all(b"\n")?;
@@ -467,6 +565,7 @@ impl HelperTransportMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HelperSocketProtocol {
+    Auto,
     CookieOnly,
     UsernameCookie,
 }
@@ -474,6 +573,7 @@ enum HelperSocketProtocol {
 impl HelperSocketProtocol {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "socket-activated-auto",
             Self::CookieOnly => "socket-activated-cookie-only",
             Self::UsernameCookie => "socket-activated-username-cookie",
         }
@@ -497,10 +597,13 @@ fn helper_socket_protocol() -> HelperSocketProtocol {
         .map(|value| value.trim().to_ascii_lowercase())
         .as_deref()
     {
+        Some("cookie-only") | Some("cookie_only") | Some("cookieonly") => {
+            HelperSocketProtocol::CookieOnly
+        }
         Some("username-cookie") | Some("username_cookie") | Some("usernamecookie") => {
             HelperSocketProtocol::UsernameCookie
         }
-        _ => HelperSocketProtocol::CookieOnly,
+        _ => HelperSocketProtocol::Auto,
     }
 }
 
@@ -683,8 +786,16 @@ mod tests {
             let read_stream = stream.try_clone().expect("clone");
             let mut reader = BufReader::new(read_stream);
 
-            let mut cookie = String::new();
-            reader.read_line(&mut cookie).expect("read cookie");
+            let mut first_line = String::new();
+            reader.read_line(&mut first_line).expect("read first line");
+            let first = first_line.trim().to_string();
+            let cookie = if first == "alice" {
+                let mut cookie = String::new();
+                reader.read_line(&mut cookie).expect("read cookie");
+                cookie.trim().to_string()
+            } else {
+                first
+            };
 
             stream
                 .write_all(b"PAM_PROMPT_ECHO_OFF Password:\n")
@@ -696,7 +807,7 @@ mod tests {
 
             {
                 let mut lines = transcript_for_thread.lock().expect("lock transcript");
-                lines.push(cookie.trim().to_string());
+                lines.push(cookie);
                 lines.push(secret.trim().to_string());
             }
 
@@ -734,8 +845,12 @@ mod tests {
             let read_stream = stream.try_clone().expect("clone");
             let mut reader = BufReader::new(read_stream);
 
-            let mut cookie = String::new();
-            reader.read_line(&mut cookie).expect("read cookie");
+            let mut first_line = String::new();
+            reader.read_line(&mut first_line).expect("read first line");
+            if first_line.trim() == "alice" {
+                let mut cookie = String::new();
+                reader.read_line(&mut cookie).expect("read cookie");
+            }
 
             stream
                 .write_all(b"PAM_PROMPT_ECHO_OFF Password:\n")
