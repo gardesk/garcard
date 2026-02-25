@@ -33,6 +33,7 @@ pub struct CommandPrompt {
     prompt_timeout_secs: u64,
     session: Option<PromptSession>,
     session_unavailable: bool,
+    next_prompt_tone: Option<PromptTone>,
 }
 
 impl Default for CommandPrompt {
@@ -48,12 +49,15 @@ impl Default for CommandPrompt {
             prompt_timeout_secs,
             session: None,
             session_unavailable: false,
+            next_prompt_tone: None,
         }
     }
 }
 
 impl CommandPrompt {
     fn run_prompt(&mut self, prompt: &str, visible: bool) -> Result<PromptResponse> {
+        let tone = self.next_prompt_tone.take().unwrap_or(PromptTone::Default);
+
         if let Some(command) = self.prompt_command.as_deref() {
             tracing::debug!(visible, "Using custom prompt command backend");
             return run_custom_prompt_command(command, prompt, visible);
@@ -71,7 +75,8 @@ impl CommandPrompt {
                         PromptMode::Secret
                     },
                     timeout_secs,
-                    tone: UiPromptTone::Default,
+                    tone: to_ui_tone(tone),
+                    feedback_only: false,
                 };
                 let started = Instant::now();
                 Some((session.run(request), started.elapsed()))
@@ -106,7 +111,7 @@ impl CommandPrompt {
             }
         }
 
-        match run_gartk_prompt_subcommand(prompt, visible, timeout_secs) {
+        match run_gartk_prompt_subcommand(prompt, visible, timeout_secs, tone) {
             Ok(response) => {
                 tracing::debug!(visible, response = ?response, "Prompt subprocess completed");
                 Ok(response)
@@ -189,11 +194,14 @@ impl PromptProvider for CommandPrompt {
     }
 
     fn auth_succeeded(&mut self) -> Result<()> {
+        self.next_prompt_tone = None;
         self.run_feedback("Authentication succeeded", PromptTone::Success)
     }
 
     fn auth_failed(&mut self, message: &str) -> Result<()> {
-        self.run_feedback(message, PromptTone::Error)
+        tracing::warn!("polkit helper message: {}", message);
+        self.next_prompt_tone = Some(PromptTone::Error);
+        Ok(())
     }
 }
 
@@ -224,6 +232,7 @@ fn run_gartk_prompt_subcommand(
     prompt: &str,
     visible: bool,
     timeout_secs: u64,
+    tone: PromptTone,
 ) -> Result<PromptResponse> {
     let mode = if visible { "plain" } else { "secret" };
     let executable =
@@ -237,7 +246,7 @@ fn run_gartk_prompt_subcommand(
         .arg("--timeout-secs")
         .arg(timeout_secs.to_string())
         .arg("--tone")
-        .arg(PromptTone::Default.as_arg())
+        .arg(tone.as_arg())
         .output()
         .context("failed to launch garcard prompt subcommand")?;
 

@@ -225,13 +225,20 @@ impl HelperSocketClient {
                 }
                 HelperEvent::Failure => {
                     if saw_no_session_cookie {
+                        if let Some(helper) = resolve_direct_helper_path() {
+                            tracing::warn!(
+                                helper = %helper.display(),
+                                "Socket helper reported no session for cookie; falling back to direct helper process"
+                            );
+                            return self.authenticate_via_helper_process_with_helper(
+                                &helper,
+                                &username_line,
+                                &cookie_line,
+                                prompts,
+                            );
+                        }
                         tracing::warn!(
-                            "Socket helper reported no session for cookie; falling back to direct helper process"
-                        );
-                        return self.authenticate_via_helper_process(
-                            &username_line,
-                            &cookie_line,
-                            prompts,
+                            "Socket helper reported no session for cookie and no viable direct helper is available; treating as authentication failure"
                         );
                     }
                     prompts
@@ -241,17 +248,6 @@ impl HelperSocketClient {
                 }
             }
         }
-    }
-
-    fn authenticate_via_helper_process<P: PromptProvider>(
-        &self,
-        username: &str,
-        cookie: &str,
-        prompts: &mut P,
-    ) -> Result<HelperOutcome> {
-        let helper = resolve_direct_helper_path()
-            .context("failed to locate direct polkit helper binary for socket fallback")?;
-        self.authenticate_via_helper_process_with_helper(&helper, username, cookie, prompts)
     }
 
     fn authenticate_via_helper_process_with_helper<P: PromptProvider>(

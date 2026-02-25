@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use gartk_core::{Color, InputEvent, Key, KeyEvent, Rect, Theme};
-use gartk_render::{copy_surface_to_window, Renderer, TextStyle};
+use gartk_render::{Renderer, TextStyle, copy_surface_to_window};
 use gartk_x11::{
-    monitor_at_pointer, primary_monitor, Connection, EventLoop, EventLoopConfig, Window,
-    WindowConfig,
+    Connection, EventLoop, EventLoopConfig, Window, WindowConfig, monitor_at_pointer,
+    primary_monitor,
 };
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection as X11Connection;
@@ -33,6 +33,7 @@ pub struct PromptRequest {
     pub mode: PromptMode,
     pub timeout_secs: u64,
     pub tone: PromptTone,
+    pub feedback_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +153,7 @@ impl PromptSession {
             mode: PromptMode::Secret,
             timeout_secs: 0,
             tone: PromptTone::Default,
+            feedback_only: false,
         };
 
         let conn = Connection::connect(None).context("failed to connect to X11 display")?;
@@ -188,6 +190,7 @@ impl PromptSession {
             mode: PromptMode::Plain,
             timeout_secs,
             tone,
+            feedback_only: true,
         })?;
         Ok(())
     }
@@ -377,7 +380,7 @@ impl PromptDialog {
     }
 
     fn handle_key(&mut self, key_event: &KeyEvent) {
-        if self.request.tone != PromptTone::Default {
+        if self.request.feedback_only {
             // Feedback dialogs are transient; ignore keypresses so the submit key
             // from the previous prompt cannot dismiss success/error feedback early.
             return;
@@ -547,10 +550,10 @@ impl PromptDialog {
             .font_family(theme.font_family)
             .font_size(12.0)
             .color(theme.item_description);
-        let footer_text = if self.request.tone == PromptTone::Default {
-            "Enter submit   Esc cancel"
-        } else {
+        let footer_text = if self.request.feedback_only {
             "Please wait"
+        } else {
+            "Enter submit   Esc cancel"
         };
         self.renderer.text(
             footer_text,

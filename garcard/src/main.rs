@@ -85,6 +85,7 @@ async fn main() -> Result<()> {
                     PromptToneArg::Success => prompt_ui::PromptTone::Success,
                     PromptToneArg::Error => prompt_ui::PromptTone::Error,
                 },
+                feedback_only: false,
             };
 
             let outcome = match prompt_ui::run_prompt_dialog(request) {
