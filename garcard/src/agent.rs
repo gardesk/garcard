@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use zbus::blocking::{Connection, Proxy};
 use zbus::fdo;
@@ -76,6 +76,8 @@ struct ActiveRequest {
 struct PolkitRuntime {
     auth_state: Arc<AuthState>,
     queue: Mutex<AuthQueue<AuthRequest>>,
+    outcomes: Mutex<HashMap<String, HelperOutcome>>,
+    outcome_signal: Condvar,
     helper_client: HelperSocketClient,
     processing: AtomicBool,
     worker_enabled: bool,
@@ -98,6 +100,8 @@ impl PolkitRuntime {
         Self {
             auth_state,
             queue: Mutex::new(AuthQueue::default()),
+            outcomes: Mutex::new(HashMap::new()),
+            outcome_signal: Condvar::new(),
             helper_client: HelperSocketClient::new(helper_socket),
             processing: AtomicBool::new(false),
             worker_enabled,
@@ -151,6 +155,10 @@ impl PolkitRuntime {
             let (active, queued) = queue.counts();
             (canceled_active, removed_queued, active, queued)
         };
+
+        if canceled_active || removed_queued {
+            self.record_outcome(cookie, HelperOutcome::Canceled);
+        }
 
         self.auth_state.sync_queue_counts(active, queued);
         if canceled_active {
@@ -324,6 +332,7 @@ impl PolkitRuntime {
             }
             return;
         }
+        self.record_outcome(cookie, outcome);
 
         if active > 0 {
             self.auth_state.set_phase(AuthPhase::PendingPrompt);
@@ -339,9 +348,40 @@ impl PolkitRuntime {
         self.auth_state.set_phase(phase);
     }
 
+    fn record_outcome(&self, cookie: &str, outcome: HelperOutcome) {
+        let mut outcomes = match self.outcomes.lock() {
+            Ok(outcomes) => outcomes,
+            Err(_) => {
+                tracing::error!("auth outcome map lock poisoned");
+                return;
+            }
+        };
+        outcomes.insert(cookie.to_string(), outcome);
+        self.outcome_signal.notify_all();
+    }
+
+    fn wait_for_completion(&self, cookie: &str) -> Result<HelperOutcome> {
+        let mut outcomes = self
+            .outcomes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("auth outcome map lock poisoned"))?;
+        loop {
+            if let Some(outcome) = outcomes.remove(cookie) {
+                return Ok(outcome);
+            }
+            outcomes = self
+                .outcome_signal
+                .wait(outcomes)
+                .map_err(|_| anyhow::anyhow!("auth outcome map lock poisoned"))?;
+        }
+    }
+
     fn reset(&self) {
         if let Ok(mut queue) = self.queue.lock() {
             queue.clear();
+        }
+        if let Ok(mut outcomes) = self.outcomes.lock() {
+            outcomes.clear();
         }
         self.processing.store(false, Ordering::Release);
         self.auth_state.set_phase(AuthPhase::Idle);
@@ -511,6 +551,18 @@ impl PolkitAuthAgentObject {
                     "Queued polkit auth request"
                 );
             }
+        }
+
+        if self.runtime.worker_enabled {
+            let outcome = self
+                .runtime
+                .wait_for_completion(cookie)
+                .map_err(|err| fdo::Error::Failed(err.to_string()))?;
+            tracing::debug!(
+                action_id = %action_id,
+                outcome = ?outcome,
+                "Completed polkit auth request callback"
+            );
         }
 
         Ok(())
