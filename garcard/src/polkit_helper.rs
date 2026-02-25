@@ -664,6 +664,8 @@ mod tests {
         plain_response: PromptResponse,
         infos: Vec<String>,
         errors: Vec<String>,
+        success_count: usize,
+        failure_messages: Vec<String>,
     }
 
     impl Default for FakePrompt {
@@ -673,6 +675,8 @@ mod tests {
                 plain_response: PromptResponse::Canceled,
                 infos: Vec::new(),
                 errors: Vec::new(),
+                success_count: 0,
+                failure_messages: Vec::new(),
             }
         }
     }
@@ -693,6 +697,16 @@ mod tests {
 
         fn show_info(&mut self, message: &str) -> Result<()> {
             self.infos.push(message.to_string());
+            Ok(())
+        }
+
+        fn auth_succeeded(&mut self) -> Result<()> {
+            self.success_count += 1;
+            Ok(())
+        }
+
+        fn auth_failed(&mut self, message: &str) -> Result<()> {
+            self.failure_messages.push(message.to_string());
             Ok(())
         }
     }
@@ -818,15 +832,15 @@ mod tests {
         let client = HelperSocketClient::new(&socket_path);
         let mut prompts = FakePrompt {
             secret_response: PromptResponse::Submitted("correct horse".to_string()),
-            plain_response: PromptResponse::Canceled,
-            infos: Vec::new(),
-            errors: Vec::new(),
+            ..FakePrompt::default()
         };
 
         let result = client
             .authenticate("alice", "cookie-123", &mut prompts)
             .expect("client auth");
         assert_eq!(result, HelperOutcome::Authorized);
+        assert_eq!(prompts.success_count, 1);
+        assert!(prompts.failure_messages.is_empty());
         server.join().expect("server join");
 
         let lines = transcript.lock().expect("lock transcript");
@@ -861,15 +875,110 @@ mod tests {
         let client = HelperSocketClient::new(&socket_path);
         let mut prompts = FakePrompt {
             secret_response: PromptResponse::TimedOut,
-            plain_response: PromptResponse::Canceled,
-            infos: Vec::new(),
-            errors: Vec::new(),
+            ..FakePrompt::default()
         };
 
         let outcome = client
             .authenticate("alice", "cookie-timeout", &mut prompts)
             .expect("authenticate timeout");
         assert_eq!(outcome, HelperOutcome::Timeout);
+
+        server.join().expect("server join");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn helper_client_reports_failure_callback_for_denied_attempt() {
+        let socket_path = temp_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let read_stream = stream.try_clone().expect("clone");
+            let mut reader = BufReader::new(read_stream);
+
+            let mut first_line = String::new();
+            reader.read_line(&mut first_line).expect("read first line");
+            if first_line.trim() == "alice" {
+                let mut cookie = String::new();
+                reader.read_line(&mut cookie).expect("read cookie");
+            }
+
+            stream
+                .write_all(b"PAM_PROMPT_ECHO_OFF Password:\n")
+                .expect("write prompt");
+            stream.flush().expect("flush prompt");
+
+            let mut secret = String::new();
+            reader.read_line(&mut secret).expect("read secret");
+
+            stream.write_all(b"FAILURE\n").expect("write failure");
+            stream.flush().expect("flush failure");
+        });
+
+        let client = HelperSocketClient::new(&socket_path);
+        let mut prompts = FakePrompt {
+            secret_response: PromptResponse::Submitted("wrong horse".to_string()),
+            ..FakePrompt::default()
+        };
+
+        let outcome = client
+            .authenticate("alice", "cookie-failure", &mut prompts)
+            .expect("authenticate failure");
+        assert_eq!(outcome, HelperOutcome::Denied);
+        assert_eq!(prompts.success_count, 0);
+        assert_eq!(prompts.failure_messages, vec!["Authentication failed"]);
+
+        server.join().expect("server join");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn helper_client_allows_success_after_diagnostic_error_line() {
+        let socket_path = temp_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let read_stream = stream.try_clone().expect("clone");
+            let mut reader = BufReader::new(read_stream);
+
+            let mut first_line = String::new();
+            reader.read_line(&mut first_line).expect("read first line");
+            if first_line.trim() == "alice" {
+                let mut cookie = String::new();
+                reader.read_line(&mut cookie).expect("read cookie");
+            }
+
+            stream
+                .write_all(b"PAM_PROMPT_ECHO_OFF Password:\n")
+                .expect("write prompt");
+            stream.flush().expect("flush prompt");
+
+            let mut secret = String::new();
+            reader.read_line(&mut secret).expect("read secret");
+
+            stream
+                .write_all(b"PAM_ERROR_MSG previous attempt failed\n")
+                .expect("write helper diagnostic");
+            stream.flush().expect("flush helper diagnostic");
+            stream.write_all(b"SUCCESS\n").expect("write success");
+            stream.flush().expect("flush success");
+        });
+
+        let client = HelperSocketClient::new(&socket_path);
+        let mut prompts = FakePrompt {
+            secret_response: PromptResponse::Submitted("correct horse".to_string()),
+            ..FakePrompt::default()
+        };
+
+        let outcome = client
+            .authenticate("alice", "cookie-success", &mut prompts)
+            .expect("authenticate success");
+        assert_eq!(outcome, HelperOutcome::Authorized);
+        assert_eq!(prompts.success_count, 1);
+        assert!(prompts.failure_messages.is_empty());
+        assert_eq!(prompts.errors, vec!["previous attempt failed"]);
 
         server.join().expect("server join");
         let _ = std::fs::remove_file(&socket_path);
