@@ -952,6 +952,39 @@ mod tests {
     }
 
     #[test]
+    fn runtime_wait_for_completion_returns_recorded_outcome() {
+        let auth_state = Arc::new(AuthState::default());
+        let runtime = Arc::new(PolkitRuntime::new_without_worker(Arc::clone(&auth_state)));
+        runtime
+            .begin_authentication(fake_request("cookie-1"))
+            .expect("begin");
+
+        runtime.complete_request("cookie-1", HelperOutcome::Authorized);
+
+        let outcome = runtime
+            .wait_for_completion("cookie-1")
+            .expect("wait for completion");
+        assert_eq!(outcome, HelperOutcome::Authorized);
+    }
+
+    #[test]
+    fn runtime_cancel_records_canceled_outcome() {
+        let auth_state = Arc::new(AuthState::default());
+        let runtime = Arc::new(PolkitRuntime::new_without_worker(Arc::clone(&auth_state)));
+        runtime
+            .begin_authentication(fake_request("cookie-1"))
+            .expect("begin");
+
+        let canceled = runtime.cancel_authentication("cookie-1").expect("cancel");
+        assert!(canceled);
+
+        let outcome = runtime
+            .wait_for_completion("cookie-1")
+            .expect("wait for completion");
+        assert_eq!(outcome, HelperOutcome::Canceled);
+    }
+
+    #[test]
     fn resolve_identity_username_uses_uid_detail() {
         let mut details = HashMap::new();
         details.insert(
