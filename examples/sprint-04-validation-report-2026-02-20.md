@@ -34,6 +34,15 @@
    - added helper diagnostic-then-success test to guard against false failure signaling on success.
    - added agent-level mocked retry conversation test (first failure, second success) to verify recoverable in-session retry behavior.
    - workspace test baseline now includes `51` `garcard` tests.
+8. Interactive acceptance closure (2026-02-25):
+   - daemon log capture: `/tmp/garcard-auth.log`.
+   - first attempt failed and retried in-session:
+     - `Received helper protocol line helper_line=FAILURE`
+     - `Authentication denied; retrying prompt ... attempt=1`
+   - second attempt succeeded:
+     - `Received helper protocol line helper_line=SUCCESS`
+     - `Completed polkit auth request callback ... outcome=Authorized`
+   - this confirms recoverable wrong-password behavior and successful-auth completion in one challenge flow.
 
 ## Hardening Outcomes Confirmed
 1. IPC control path now validates same-UID peer credentials.
@@ -44,4 +53,4 @@
 6. Built-in prompt reuses a persistent modal so auth failure feedback can flash inline and reprompt without window teardown.
 
 ## Remaining Manual Sprint 04 Checks
-1. Final interactive success confirmation in desktop session (correct password should return `pkcheck` exit `0` and show success feedback).
+1. None. Interactive success confirmation completed on 2026-02-25.
