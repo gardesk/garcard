@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use gartk_core::{Color, InputEvent, Key, KeyEvent, Rect, Theme};
-use gartk_render::{Renderer, TextStyle, copy_surface_to_window};
+use gartk_render::{copy_surface_to_window, Renderer, TextStyle};
 use gartk_x11::{
-    Connection, EventLoop, EventLoopConfig, Window, WindowConfig, monitor_at_pointer,
-    primary_monitor,
+    monitor_at_pointer, primary_monitor, Connection, EventLoop, EventLoopConfig, Window,
+    WindowConfig,
 };
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection as X11Connection;
@@ -80,9 +80,7 @@ impl X11Keymap {
         let setup = conn.inner().setup();
         let min_keycode = setup.min_keycode;
         let max_keycode = setup.max_keycode;
-        let count = max_keycode
-            .saturating_sub(min_keycode)
-            .saturating_add(1);
+        let count = max_keycode.saturating_sub(min_keycode).saturating_add(1);
         let reply = conn
             .inner()
             .get_keyboard_mapping(min_keycode, count)
@@ -380,12 +378,8 @@ impl PromptDialog {
 
     fn handle_key(&mut self, key_event: &KeyEvent) {
         if self.request.tone != PromptTone::Default {
-            match key_event.key {
-                Key::Escape | Key::Return => {
-                    self.exit = Some(PromptExit::Canceled);
-                }
-                _ => {}
-            }
+            // Feedback dialogs are transient; ignore keypresses so the submit key
+            // from the previous prompt cannot dismiss success/error feedback early.
             return;
         }
 
@@ -556,7 +550,7 @@ impl PromptDialog {
         let footer_text = if self.request.tone == PromptTone::Default {
             "Enter submit   Esc cancel"
         } else {
-            "Esc dismiss"
+            "Please wait"
         };
         self.renderer.text(
             footer_text,
