@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub const DEFAULT_HELPER_SOCKET: &str = "/run/polkit/agent-helper.socket";
@@ -88,7 +89,17 @@ impl HelperSocketClient {
             "Selected polkit helper transport mode"
         );
         if matches!(transport, HelperTransportMode::Direct) {
-            return self.authenticate_via_helper_process(&username_line, &cookie_line, prompts);
+            if let Some(helper) = resolve_direct_helper_path() {
+                return self.authenticate_via_helper_process_with_helper(
+                    &helper,
+                    &username_line,
+                    &cookie_line,
+                    prompts,
+                );
+            }
+            tracing::warn!(
+                "Direct helper transport requested but no root setuid helper was found; falling back to socket transport"
+            );
         }
 
         let mut stream = UnixStream::connect(&self.socket_path).with_context(|| {
@@ -238,15 +249,24 @@ impl HelperSocketClient {
         cookie: &str,
         prompts: &mut P,
     ) -> Result<HelperOutcome> {
-        let helper = resolve_direct_helper_path().context(
-            "failed to locate direct polkit helper binary for socket fallback",
-        )?;
+        let helper = resolve_direct_helper_path()
+            .context("failed to locate direct polkit helper binary for socket fallback")?;
+        self.authenticate_via_helper_process_with_helper(&helper, username, cookie, prompts)
+    }
+
+    fn authenticate_via_helper_process_with_helper<P: PromptProvider>(
+        &self,
+        helper: &Path,
+        username: &str,
+        cookie: &str,
+        prompts: &mut P,
+    ) -> Result<HelperOutcome> {
         tracing::info!(
             helper = %helper.display(),
             "Starting direct polkit helper fallback process"
         );
 
-        let mut child = Command::new(&helper)
+        let mut child = Command::new(helper)
             .arg(username)
             .arg(cookie)
             .stdin(Stdio::piped())
@@ -378,39 +398,47 @@ fn sanitize_control_line(raw: &str) -> String {
 fn resolve_direct_helper_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("GARCARD_POLKIT_HELPER_BIN") {
         let path = PathBuf::from(path);
-        if path.exists() {
+        if is_viable_direct_helper(&path) {
             return Some(path);
         }
+        tracing::warn!(
+            helper = %path.display(),
+            "Ignoring GARCARD_POLKIT_HELPER_BIN because helper is not root-owned setuid executable"
+        );
     }
 
     let static_candidates = [
         "/run/wrappers/bin/polkit-agent-helper-1",
+        "/run/current-system/sw/lib/polkit-1/polkit-agent-helper-1",
         "/usr/lib/polkit-1/polkit-agent-helper-1",
         "/usr/lib64/polkit-1/polkit-agent-helper-1",
         "/lib/polkit-1/polkit-agent-helper-1",
     ];
     for candidate in static_candidates {
         let path = PathBuf::from(candidate);
-        if path.exists() {
+        if is_viable_direct_helper(&path) {
             return Some(path);
         }
     }
 
-    if let Some(path) = command_in_path("polkit-agent-helper-1") {
+    if let Some(path) =
+        command_in_path("polkit-agent-helper-1").filter(|path| is_viable_direct_helper(path))
+    {
         return Some(path);
     }
 
-    // NixOS fallback path.
-    if let Ok(entries) = std::fs::read_dir("/nix/store") {
-        for entry in entries.flatten() {
-            let candidate = entry.path().join("lib/polkit-1/polkit-agent-helper-1");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-
     None
+}
+
+fn is_viable_direct_helper(path: &Path) -> bool {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return false,
+    };
+    let mode = metadata.permissions().mode();
+    let is_setuid = mode & 0o4000 != 0;
+    let is_executable = mode & 0o111 != 0;
+    metadata.uid() == 0 && is_setuid && is_executable
 }
 
 fn command_in_path(command: &str) -> Option<PathBuf> {
