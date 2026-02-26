@@ -1,6 +1,7 @@
 use crate::agent::{
     AuthAgentBackend, PolkitAgent, PolkitBackendConfig, StubPolkitAgent,
-    enumerate_temporary_authorizations,
+    enumerate_temporary_authorizations, revoke_all_temporary_authorizations,
+    revoke_temporary_authorization_by_id,
 };
 use crate::config::{AgentBackendMode, Config};
 use crate::state::{AuthState, RuntimeState};
@@ -295,6 +296,25 @@ fn dispatch(
             }
             Err(err) => Response::err(format!(
                 "failed to enumerate temporary authorizations: {}",
+                err
+            )),
+        },
+        Command::TempRevoke { authorization_id } => {
+            match revoke_temporary_authorization_by_id(authorization_id.as_str()) {
+                Ok(()) => Response::ok_with_data(json!({
+                    "authorization_id": authorization_id,
+                    "revoked": true
+                })),
+                Err(err) => Response::err(format!(
+                    "failed to revoke temporary authorization {}: {}",
+                    authorization_id, err
+                )),
+            }
+        }
+        Command::TempRevokeAll => match revoke_all_temporary_authorizations() {
+            Ok(revoked_count) => Response::ok_with_data(json!({ "revoked_count": revoked_count })),
+            Err(err) => Response::err(format!(
+                "failed to revoke temporary authorizations: {}",
                 err
             )),
         },

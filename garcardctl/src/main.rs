@@ -18,6 +18,8 @@ enum Commands {
     Version,
     AuthSummary,
     TempList,
+    TempRevoke { authorization_id: String },
+    TempRevokeAll,
     Quit,
 }
 
@@ -49,6 +51,8 @@ fn to_protocol_command(command: Commands) -> Command {
         Commands::Version => Command::Version,
         Commands::AuthSummary => Command::AuthSummary,
         Commands::TempList => Command::TempList,
+        Commands::TempRevoke { authorization_id } => Command::TempRevoke { authorization_id },
+        Commands::TempRevokeAll => Command::TempRevokeAll,
         Commands::Quit => Command::Quit,
     }
 }

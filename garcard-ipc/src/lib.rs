@@ -22,6 +22,8 @@ pub enum Command {
     Version,
     AuthSummary,
     TempList,
+    TempRevoke { authorization_id: String },
+    TempRevokeAll,
     Quit,
 }
 

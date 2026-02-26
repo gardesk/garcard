@@ -696,6 +696,29 @@ pub fn enumerate_temporary_authorizations() -> Result<Vec<TemporaryAuthorization
     Ok(entries)
 }
 
+pub fn revoke_temporary_authorization_by_id(authorization_id: &str) -> Result<()> {
+    let connection = Connection::system().context("failed to connect to system bus")?;
+    let proxy = PolkitAgent::proxy(&connection)?;
+    let _: () = proxy.call("RevokeTemporaryAuthorizationById", &authorization_id)?;
+    Ok(())
+}
+
+pub fn revoke_all_temporary_authorizations() -> Result<usize> {
+    let connection = Connection::system().context("failed to connect to system bus")?;
+    let subject = build_subject();
+    let proxy = PolkitAgent::proxy(&connection)?;
+    let authorizations: Vec<TemporaryAuthorization> =
+        proxy.call("EnumerateTemporaryAuthorizations", &subject)?;
+
+    let mut revoked = 0_usize;
+    for (authorization_id, _action_id, _subject, _obtained, _expires) in authorizations {
+        let _: () = proxy.call("RevokeTemporaryAuthorizationById", &authorization_id)?;
+        revoked += 1;
+    }
+
+    Ok(revoked)
+}
+
 fn revoke_temporary_authorizations_for_action(action_id: &str) -> Result<usize> {
     let connection = Connection::system().context("failed to connect to system bus")?;
     let subject = build_subject();
