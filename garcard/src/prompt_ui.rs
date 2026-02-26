@@ -5,6 +5,9 @@ use gartk_x11::{
     Connection, EventLoop, EventLoopConfig, Window, WindowConfig, monitor_at_pointer,
     primary_monitor,
 };
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection as X11Connection;
 use x11rb::protocol::xproto::ConnectionExt;
@@ -17,38 +20,107 @@ const RETRY_ERROR_FLASH_DURATION: Duration = Duration::from_millis(900);
 const DEFAULT_UI_SCALE: f32 = 1.0;
 const MIN_UI_SCALE: f32 = 0.8;
 const MAX_UI_SCALE: f32 = 2.0;
+const PROMPT_STRINGS_FILE_ENV: &str = "GARCARD_PROMPT_STRINGS_FILE";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PromptStrings {
-    title_auth_required: &'static str,
-    label_password: &'static str,
-    label_response: &'static str,
-    footer_wait: &'static str,
-    footer_controls: &'static str,
-    timeout_label: &'static str,
+    title_auth_required: String,
+    label_password: String,
+    label_response: String,
+    footer_wait: String,
+    footer_controls: String,
+    timeout_label: String,
 }
 
 impl PromptStrings {
     fn for_locale(locale: &str) -> Self {
         match locale_bucket(locale) {
             "es" => Self {
-                title_auth_required: "Autenticacion requerida",
-                label_password: "Contrasena",
-                label_response: "Respuesta",
-                footer_wait: "Espere",
-                footer_controls: "Enter enviar   Esc cancelar",
-                timeout_label: "tiempo",
+                title_auth_required: "Autenticacion requerida".to_string(),
+                label_password: "Contrasena".to_string(),
+                label_response: "Respuesta".to_string(),
+                footer_wait: "Espere".to_string(),
+                footer_controls: "Enter enviar   Esc cancelar".to_string(),
+                timeout_label: "tiempo".to_string(),
             },
             _ => Self {
-                title_auth_required: "Authentication Required",
-                label_password: "Password",
-                label_response: "Response",
-                footer_wait: "Please wait",
-                footer_controls: "Enter submit   Esc cancel",
-                timeout_label: "timeout",
+                title_auth_required: "Authentication Required".to_string(),
+                label_password: "Password".to_string(),
+                label_response: "Response".to_string(),
+                footer_wait: "Please wait".to_string(),
+                footer_controls: "Enter submit   Esc cancel".to_string(),
+                timeout_label: "timeout".to_string(),
             },
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PromptStringsPatch {
+    #[serde(default)]
+    title_auth_required: Option<String>,
+    #[serde(default)]
+    label_password: Option<String>,
+    #[serde(default)]
+    label_response: Option<String>,
+    #[serde(default)]
+    footer_wait: Option<String>,
+    #[serde(default)]
+    footer_controls: Option<String>,
+    #[serde(default)]
+    timeout_label: Option<String>,
+}
+
+impl PromptStringsPatch {
+    fn overlay_from(&mut self, other: &Self) {
+        if other.title_auth_required.is_some() {
+            self.title_auth_required = other.title_auth_required.clone();
+        }
+        if other.label_password.is_some() {
+            self.label_password = other.label_password.clone();
+        }
+        if other.label_response.is_some() {
+            self.label_response = other.label_response.clone();
+        }
+        if other.footer_wait.is_some() {
+            self.footer_wait = other.footer_wait.clone();
+        }
+        if other.footer_controls.is_some() {
+            self.footer_controls = other.footer_controls.clone();
+        }
+        if other.timeout_label.is_some() {
+            self.timeout_label = other.timeout_label.clone();
+        }
+    }
+
+    fn apply_to(&self, strings: &mut PromptStrings) {
+        if let Some(value) = &self.title_auth_required {
+            strings.title_auth_required = value.clone();
+        }
+        if let Some(value) = &self.label_password {
+            strings.label_password = value.clone();
+        }
+        if let Some(value) = &self.label_response {
+            strings.label_response = value.clone();
+        }
+        if let Some(value) = &self.footer_wait {
+            strings.footer_wait = value.clone();
+        }
+        if let Some(value) = &self.footer_controls {
+            strings.footer_controls = value.clone();
+        }
+        if let Some(value) = &self.timeout_label {
+            strings.timeout_label = value.clone();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PromptStringsCatalog {
+    #[serde(default)]
+    default: PromptStringsPatch,
+    #[serde(default)]
+    locales: HashMap<String, PromptStringsPatch>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -138,6 +210,13 @@ fn prompt_scale_from_env(raw: Option<&str>) -> f32 {
     parsed.clamp(MIN_UI_SCALE, MAX_UI_SCALE)
 }
 
+fn scaled_dialog_dimensions(scale: f32) -> (u32, u32) {
+    let clamped = scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
+    let width = ((BASE_DIALOG_WIDTH as f32) * clamped).round().max(320.0) as u32;
+    let height = ((BASE_DIALOG_HEIGHT as f32) * clamped).round().max(180.0) as u32;
+    (width, height)
+}
+
 fn parse_bool_env(raw: Option<&str>) -> bool {
     match raw.map(|value| value.trim().to_ascii_lowercase()) {
         Some(value)
@@ -151,6 +230,65 @@ fn parse_bool_env(raw: Option<&str>) -> bool {
         }
         _ => false,
     }
+}
+
+fn parse_prompt_strings_catalog(raw: &str) -> Result<PromptStringsCatalog> {
+    serde_json::from_str(raw)
+        .or_else(|json_err| {
+            toml::from_str(raw).map_err(|toml_err| {
+                anyhow::anyhow!(
+                    "failed to parse prompt strings catalog as json ({}) or toml ({})",
+                    json_err,
+                    toml_err
+                )
+            })
+        })
+        .context("failed to parse prompt strings catalog")
+}
+
+fn load_prompt_strings_catalog(path: &Path) -> Result<PromptStringsCatalog> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read prompt strings catalog {}", path.display()))?;
+    parse_prompt_strings_catalog(&raw)
+}
+
+fn prompt_strings_with_catalog(
+    locale: &str,
+    catalog: Option<&PromptStringsCatalog>,
+) -> PromptStrings {
+    let mut strings = PromptStrings::for_locale(locale);
+    let Some(catalog) = catalog else {
+        return strings;
+    };
+
+    let mut patch = catalog.default.clone();
+    if let Some(locale_patch) = catalog.locales.get(locale_bucket(locale)) {
+        patch.overlay_from(locale_patch);
+    }
+    if let Some(locale_patch) = catalog.locales.get(locale) {
+        patch.overlay_from(locale_patch);
+    }
+    patch.apply_to(&mut strings);
+    strings
+}
+
+fn prompt_strings_for_locale(locale: &str) -> PromptStrings {
+    let catalog = std::env::var_os(PROMPT_STRINGS_FILE_ENV)
+        .map(std::path::PathBuf::from)
+        .and_then(|path| match load_prompt_strings_catalog(&path) {
+            Ok(catalog) => Some(catalog),
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    env_key = PROMPT_STRINGS_FILE_ENV,
+                    "Failed to load prompt string catalog; using built-in strings"
+                );
+                None
+            }
+        });
+
+    prompt_strings_with_catalog(locale, catalog.as_ref())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,16 +438,15 @@ impl PromptSession {
             feedback_only: false,
         };
         let ui = PromptUiConfig::from_env();
-        let strings = PromptStrings::for_locale(&ui.locale);
-        let dialog_width = ((BASE_DIALOG_WIDTH as f32) * ui.ui_scale).round() as u32;
-        let dialog_height = ((BASE_DIALOG_HEIGHT as f32) * ui.ui_scale).round() as u32;
+        let strings = prompt_strings_for_locale(&ui.locale);
+        let (dialog_width, dialog_height) = scaled_dialog_dimensions(ui.ui_scale);
 
         let conn = Connection::connect(None).context("failed to connect to X11 display")?;
         let (x, y) = centered_position(&conn, dialog_width, dialog_height);
         let window = Window::create(
             conn.clone(),
             WindowConfig::dialog()
-                .title(strings.title_auth_required)
+                .title(strings.title_auth_required.as_str())
                 .class("garcard")
                 .position(x, y)
                 .size(dialog_width, dialog_height)
@@ -319,7 +456,7 @@ impl PromptSession {
         .context("failed to create prompt window")?;
         window.focus().context("failed to focus prompt window")?;
 
-        let dialog = PromptDialog::new(window, request, &ui)?;
+        let dialog = PromptDialog::new(window, request, &ui, strings)?;
         Ok(Self { dialog })
     }
 
@@ -438,7 +575,12 @@ fn centered_position(conn: &Connection, width: u32, height: u32) -> (i32, i32) {
 }
 
 impl PromptDialog {
-    fn new(window: Window, request: PromptRequest, ui: &PromptUiConfig) -> Result<Self> {
+    fn new(
+        window: Window,
+        request: PromptRequest,
+        ui: &PromptUiConfig,
+        strings: PromptStrings,
+    ) -> Result<Self> {
         let mut theme = Theme::dark();
         theme.font_family = std::env::var("GARCARD_PROMPT_FONT_FAMILY")
             .ok()
@@ -446,7 +588,6 @@ impl PromptDialog {
             .unwrap_or_else(|| "Noto Sans".to_string());
         theme.font_size = (14.0_f64 * ui.ui_scale as f64).max(12.0);
         let palette = PromptPalette::from_high_contrast(ui.high_contrast)?;
-        let strings = PromptStrings::for_locale(&ui.locale);
         let size = window.size();
         let renderer = Renderer::with_theme(size.width, size.height, theme)?;
 
@@ -627,7 +768,7 @@ impl PromptDialog {
             .font_size(self.scaled_f64(18.0))
             .color(theme.foreground);
         self.renderer.text(
-            self.strings.title_auth_required,
+            self.strings.title_auth_required.as_str(),
             (pad + body_inset) as f64,
             (pad + title_top) as f64,
             &title_style,
@@ -648,8 +789,8 @@ impl PromptDialog {
         )?;
 
         let input_label = match self.request.mode {
-            PromptMode::Secret => self.strings.label_password,
-            PromptMode::Plain => self.strings.label_response,
+            PromptMode::Secret => self.strings.label_password.as_str(),
+            PromptMode::Plain => self.strings.label_response.as_str(),
         };
         let label_style = TextStyle::new()
             .font_family(theme.font_family.clone())
@@ -722,9 +863,9 @@ impl PromptDialog {
             .font_size(self.scaled_f64(12.0))
             .color(theme.item_description);
         let footer_text = if self.request.feedback_only {
-            self.strings.footer_wait
+            self.strings.footer_wait.as_str()
         } else {
-            self.strings.footer_controls
+            self.strings.footer_controls.as_str()
         };
         self.renderer.text(
             footer_text,
@@ -960,6 +1101,21 @@ mod tests {
     }
 
     #[test]
+    fn scaled_dialog_dimensions_track_scale_bounds() {
+        let (small_w, small_h) = scaled_dialog_dimensions(0.1);
+        assert!(small_w >= 320);
+        assert!(small_h >= 180);
+
+        let (normal_w, normal_h) = scaled_dialog_dimensions(1.0);
+        assert_eq!(normal_w, BASE_DIALOG_WIDTH);
+        assert_eq!(normal_h, BASE_DIALOG_HEIGHT);
+
+        let (large_w, large_h) = scaled_dialog_dimensions(2.5);
+        assert!(large_w > normal_w);
+        assert!(large_h > normal_h);
+    }
+
+    #[test]
     fn parse_bool_env_accepts_common_truthy_values() {
         assert!(parse_bool_env(Some("1")));
         assert!(parse_bool_env(Some("TRUE")));
@@ -977,6 +1133,32 @@ mod tests {
         let spanish = PromptStrings::for_locale("es_ES.UTF-8");
         assert_eq!(spanish.label_password, "Contrasena");
         assert_eq!(spanish.footer_wait, "Espere");
+    }
+
+    #[test]
+    fn parse_prompt_strings_catalog_reads_json_and_applies_locale_overrides() {
+        let raw = r#"{
+          "default": { "footer_controls": "Enter send   Esc dismiss" },
+          "locales": {
+            "es": { "label_password": "Clave" },
+            "es_MX.UTF-8": { "footer_wait": "Aguarde" }
+          }
+        }"#;
+        let catalog = parse_prompt_strings_catalog(raw).expect("parse catalog");
+        let strings = prompt_strings_with_catalog("es_MX.UTF-8", Some(&catalog));
+        assert_eq!(strings.label_password, "Clave");
+        assert_eq!(strings.footer_wait, "Aguarde");
+        assert_eq!(strings.footer_controls, "Enter send   Esc dismiss");
+    }
+
+    #[test]
+    fn high_contrast_palette_uses_strong_focus_ring() {
+        let normal = PromptPalette::from_high_contrast(false).expect("normal palette");
+        let high = PromptPalette::from_high_contrast(true).expect("high contrast palette");
+        assert!(high.focus_ring.r >= 0.99);
+        assert!(high.focus_ring.g >= 0.99);
+        assert!(high.focus_ring.b >= 0.99);
+        assert!(high.card_border.r > normal.card_border.r);
     }
 
     #[test]
