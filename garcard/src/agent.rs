@@ -1,5 +1,5 @@
 use crate::polkit_helper::{
-    DEFAULT_HELPER_SOCKET, HelperOutcome, HelperSocketClient, PromptProvider,
+    DEFAULT_HELPER_SOCKET, HelperOutcome, HelperSocketClient, PromptProvider, PromptResponse,
 };
 use crate::prompt::CommandPrompt;
 use crate::state::{AuthPhase, AuthQueue, AuthState, QueueInsert};
@@ -56,6 +56,7 @@ pub struct PolkitBackendConfig {
 type Subject = (String, HashMap<String, OwnedValue>);
 type Details = HashMap<String, String>;
 const DEFAULT_AUTH_MAX_ATTEMPTS: usize = 3;
+const DEFAULT_IDENTITY_SELECTION_ATTEMPTS: usize = 3;
 
 #[derive(Debug)]
 struct AuthRequest {
@@ -76,6 +77,7 @@ struct ActiveRequest {
     details: Details,
     cookie: String,
     username: String,
+    identity_options: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -323,6 +325,13 @@ impl PolkitRuntime {
             .or_else(current_username)
             .or_else(|| std::env::var("USER").ok())
             .unwrap_or_else(|| "unknown".to_string());
+        let mut identity_options = identity_options_from_subjects(&request.identities);
+        if !identity_options
+            .iter()
+            .any(|candidate| candidate == &username)
+        {
+            identity_options.insert(0, username.clone());
+        }
 
         tracing::debug!(
             identity_summary = %summarize_identities(&request.identities),
@@ -338,6 +347,7 @@ impl PolkitRuntime {
             details: request.details.clone(),
             cookie: request.cookie.clone(),
             username,
+            identity_options,
         })
     }
 
@@ -353,6 +363,10 @@ impl PolkitRuntime {
     ) -> HelperOutcome {
         let prompt_context = render_prompt_context(request);
         let max_attempts = auth_max_attempts();
+        let username = match select_identity_for_request(request, prompts) {
+            IdentitySelection::Selected(selected) => selected,
+            IdentitySelection::Terminal(outcome) => return outcome,
+        };
 
         for attempt in 1..=max_attempts {
             if self.is_canceled(&request.cookie) {
@@ -371,11 +385,10 @@ impl PolkitRuntime {
 
             let mut cancel_aware =
                 CancellationAwarePrompt::new(prompts, self, request.cookie.as_str());
-            match self.helper_client.authenticate(
-                &request.username,
-                &request.cookie,
-                &mut cancel_aware,
-            ) {
+            match self
+                .helper_client
+                .authenticate(&username, &request.cookie, &mut cancel_aware)
+            {
                 Ok(outcome) if self.is_canceled(&request.cookie) => {
                     tracing::info!(
                         action_id = %request.action_id,
@@ -556,6 +569,123 @@ fn render_prompt_context(request: &ActiveRequest) -> String {
     }
 
     lines.join("\n")
+}
+
+enum IdentitySelection {
+    Selected(String),
+    Terminal(HelperOutcome),
+}
+
+fn select_identity_for_request<P: PromptProvider>(
+    request: &ActiveRequest,
+    prompts: &mut P,
+) -> IdentitySelection {
+    if request.identity_options.len() <= 1 {
+        return IdentitySelection::Selected(request.username.clone());
+    }
+
+    let prompt = render_identity_selection_prompt(request);
+    for attempt in 1..=DEFAULT_IDENTITY_SELECTION_ATTEMPTS {
+        match prompts.prompt_plain(&prompt) {
+            Ok(PromptResponse::Submitted(mut raw)) => {
+                if let Some(selected) = parse_identity_selection(
+                    raw.as_str(),
+                    &request.identity_options,
+                    &request.username,
+                ) {
+                    raw.clear();
+                    return IdentitySelection::Selected(selected);
+                }
+
+                raw.clear();
+                let _ = prompts.show_error("Invalid identity selection");
+                if attempt == DEFAULT_IDENTITY_SELECTION_ATTEMPTS {
+                    tracing::warn!(
+                        action_id = %request.action_id,
+                        default_identity = %request.username,
+                        "Identity selection failed repeatedly; using default identity"
+                    );
+                    return IdentitySelection::Selected(request.username.clone());
+                }
+            }
+            Ok(PromptResponse::Canceled) => {
+                return IdentitySelection::Terminal(HelperOutcome::Canceled);
+            }
+            Ok(PromptResponse::TimedOut) => {
+                return IdentitySelection::Terminal(HelperOutcome::Timeout);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    action_id = %request.action_id,
+                    error = %err,
+                    default_identity = %request.username,
+                    "Identity selection prompt failed; using default identity"
+                );
+                return IdentitySelection::Selected(request.username.clone());
+            }
+        }
+    }
+
+    IdentitySelection::Selected(request.username.clone())
+}
+
+fn render_identity_selection_prompt(request: &ActiveRequest) -> String {
+    let mut lines = vec![
+        "Select authentication identity".to_string(),
+        format!("Action: {}", request.action_id),
+    ];
+    for (index, option) in request.identity_options.iter().enumerate() {
+        if option == &request.username {
+            lines.push(format!("{}: {} (default)", index + 1, option));
+        } else {
+            lines.push(format!("{}: {}", index + 1, option));
+        }
+    }
+    lines.push("Enter number or username (blank for default)".to_string());
+    lines.join("\n")
+}
+
+fn parse_identity_selection(input: &str, options: &[String], default: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Some(default.to_string());
+    }
+
+    if let Ok(index) = trimmed.parse::<usize>() {
+        if (1..=options.len()).contains(&index) {
+            return options.get(index - 1).cloned();
+        }
+    }
+
+    options
+        .iter()
+        .find(|option| option.eq_ignore_ascii_case(trimmed))
+        .cloned()
+}
+
+fn identity_options_from_subjects(identities: &[Subject]) -> Vec<String> {
+    let mut options = Vec::new();
+    let mut seen = HashSet::new();
+
+    for (kind, details) in identities {
+        if kind != "unix-user" {
+            continue;
+        }
+
+        let Some(name) = identity_name(details) else {
+            continue;
+        };
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let dedupe_key = trimmed.to_ascii_lowercase();
+        if seen.insert(dedupe_key) {
+            options.push(trimmed.to_string());
+        }
+    }
+
+    options
 }
 
 fn detail_key_label(key: &str) -> &'static str {
@@ -1042,6 +1172,7 @@ mod tests {
         responses: VecDeque<PromptResponse>,
         success_count: usize,
         failure_messages: Vec<String>,
+        error_messages: Vec<String>,
         prompt_count: usize,
     }
 
@@ -1051,6 +1182,7 @@ mod tests {
                 responses: VecDeque::from(responses),
                 success_count: 0,
                 failure_messages: Vec::new(),
+                error_messages: Vec::new(),
                 prompt_count: 0,
             }
         }
@@ -1076,6 +1208,11 @@ mod tests {
 
         fn auth_failed(&mut self, message: &str) -> Result<()> {
             self.failure_messages.push(message.to_string());
+            Ok(())
+        }
+
+        fn show_error(&mut self, message: &str) -> Result<()> {
+            self.error_messages.push(message.to_string());
             Ok(())
         }
     }
@@ -1323,6 +1460,7 @@ mod tests {
             details: HashMap::new(),
             cookie: "cookie-1".to_string(),
             username: "alice".to_string(),
+            identity_options: vec!["alice".to_string()],
         };
         let mut prompts = SequencedPrompt::new(vec![
             PromptResponse::Submitted("correct horse".to_string()),
@@ -1380,6 +1518,7 @@ mod tests {
             details: HashMap::new(),
             cookie: "cookie-timeout".to_string(),
             username: "alice".to_string(),
+            identity_options: vec!["alice".to_string()],
         };
         let mut prompts = SequencedPrompt::new(vec![PromptResponse::TimedOut]);
 
@@ -1410,6 +1549,7 @@ mod tests {
             details,
             cookie: "cookie-ctx".to_string(),
             username: "alice".to_string(),
+            identity_options: vec!["alice".to_string()],
         };
 
         let context = render_prompt_context(&request);
@@ -1419,6 +1559,67 @@ mod tests {
         assert!(context.contains("Program: /usr/bin/meson"));
         assert!(context.contains("Command: meson install"));
         assert!(context.contains("Retains authorization: 1"));
+    }
+
+    #[test]
+    fn parse_identity_selection_accepts_blank_index_and_name() {
+        let options = vec!["alice".to_string(), "root".to_string()];
+        assert_eq!(
+            parse_identity_selection("", &options, "alice"),
+            Some("alice".to_string())
+        );
+        assert_eq!(
+            parse_identity_selection("2", &options, "alice"),
+            Some("root".to_string())
+        );
+        assert_eq!(
+            parse_identity_selection("ROOT", &options, "alice"),
+            Some("root".to_string())
+        );
+        assert_eq!(parse_identity_selection("99", &options, "alice"), None);
+    }
+
+    #[test]
+    fn select_identity_for_request_uses_prompted_choice() {
+        let request = ActiveRequest {
+            action_id: "org.gardesk.test".to_string(),
+            message: "Authenticate".to_string(),
+            icon_name: "dialog-password".to_string(),
+            detail_count: 0,
+            details: HashMap::new(),
+            cookie: "cookie-identity".to_string(),
+            username: "alice".to_string(),
+            identity_options: vec!["alice".to_string(), "root".to_string()],
+        };
+        let mut prompts = SequencedPrompt::new(vec![PromptResponse::Submitted("2".to_string())]);
+
+        let selection = select_identity_for_request(&request, &mut prompts);
+        assert!(matches!(
+            selection,
+            IdentitySelection::Selected(username) if username == "root"
+        ));
+        assert_eq!(prompts.prompt_count, 1);
+    }
+
+    #[test]
+    fn select_identity_for_request_returns_canceled_outcome() {
+        let request = ActiveRequest {
+            action_id: "org.gardesk.test".to_string(),
+            message: "Authenticate".to_string(),
+            icon_name: "dialog-password".to_string(),
+            detail_count: 0,
+            details: HashMap::new(),
+            cookie: "cookie-identity-cancel".to_string(),
+            username: "alice".to_string(),
+            identity_options: vec!["alice".to_string(), "root".to_string()],
+        };
+        let mut prompts = SequencedPrompt::new(vec![PromptResponse::Canceled]);
+
+        let selection = select_identity_for_request(&request, &mut prompts);
+        assert!(matches!(
+            selection,
+            IdentitySelection::Terminal(HelperOutcome::Canceled)
+        ));
     }
 
     #[test]
