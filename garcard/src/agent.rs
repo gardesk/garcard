@@ -417,7 +417,11 @@ impl PolkitRuntime {
                     action_id = %request.action_id,
                     "Authentication request canceled before helper attempt"
                 );
-                return self.finalize_auth_attempt(request, HelperOutcome::Canceled, Some(retention));
+                return self.finalize_auth_attempt(
+                    request,
+                    HelperOutcome::Canceled,
+                    Some(retention),
+                );
             }
             tracing::info!(
                 context = %prompt_context,
@@ -1890,6 +1894,137 @@ mod tests {
     }
 
     #[test]
+    fn authenticate_active_request_terminal_outcome_matrix() {
+        struct Case {
+            label: &'static str,
+            responses: Vec<PromptResponse>,
+            server_results: Vec<Option<&'static str>>,
+            expected_outcome: HelperOutcome,
+            expected_success_count: usize,
+            expected_failure_count: usize,
+        }
+
+        let cases = vec![
+            Case {
+                label: "success",
+                responses: vec![PromptResponse::Submitted("correct horse".to_string())],
+                server_results: vec![Some("SUCCESS")],
+                expected_outcome: HelperOutcome::Authorized,
+                expected_success_count: 1,
+                expected_failure_count: 0,
+            },
+            Case {
+                label: "failure",
+                responses: vec![
+                    PromptResponse::Submitted("wrong horse".to_string()),
+                    PromptResponse::Submitted("wrong horse".to_string()),
+                    PromptResponse::Submitted("wrong horse".to_string()),
+                ],
+                server_results: vec![Some("FAILURE"), Some("FAILURE"), Some("FAILURE")],
+                expected_outcome: HelperOutcome::Denied,
+                expected_success_count: 0,
+                expected_failure_count: 3,
+            },
+            Case {
+                label: "canceled",
+                responses: vec![PromptResponse::Canceled],
+                server_results: vec![None],
+                expected_outcome: HelperOutcome::Canceled,
+                expected_success_count: 0,
+                expected_failure_count: 0,
+            },
+            Case {
+                label: "timeout",
+                responses: vec![PromptResponse::TimedOut],
+                server_results: vec![None],
+                expected_outcome: HelperOutcome::Timeout,
+                expected_success_count: 0,
+                expected_failure_count: 0,
+            },
+        ];
+
+        for case in cases {
+            let socket_path = temp_socket_path();
+            let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+            let server_results = case.server_results.clone();
+
+            let server = thread::spawn(move || {
+                for expected_result in server_results {
+                    let (mut stream, _) = listener.accept().expect("accept");
+                    let read_stream = stream.try_clone().expect("clone");
+                    let mut reader = BufReader::new(read_stream);
+
+                    let mut first_line = String::new();
+                    reader.read_line(&mut first_line).expect("read first line");
+                    if first_line.trim() == "operator" {
+                        let mut cookie = String::new();
+                        reader.read_line(&mut cookie).expect("read cookie");
+                    }
+
+                    stream
+                        .write_all(b"PAM_PROMPT_ECHO_OFF Password:\n")
+                        .expect("write prompt");
+                    stream.flush().expect("flush prompt");
+
+                    let mut secret = String::new();
+                    let read = reader.read_line(&mut secret).expect("read secret");
+                    if let Some(result) = expected_result {
+                        assert!(
+                            read > 0,
+                            "expected submitted secret response for {}",
+                            result
+                        );
+                        stream
+                            .write_all(format!("{}\n", result).as_bytes())
+                            .expect("write result");
+                        stream.flush().expect("flush result");
+                    }
+                }
+            });
+
+            let runtime = PolkitRuntime {
+                auth_state: Arc::new(AuthState::default()),
+                queue: Mutex::new(AuthQueue::default()),
+                outcomes: Mutex::new(HashMap::new()),
+                canceled_cookies: Mutex::new(HashSet::new()),
+                outcome_signal: Condvar::new(),
+                helper_client: HelperSocketClient::new(&socket_path),
+                processing: AtomicBool::new(false),
+                worker_enabled: false,
+            };
+            let active = ActiveRequest {
+                action_id: "org.gardesk.test".to_string(),
+                message: "Authenticate".to_string(),
+                icon_name: "dialog-password".to_string(),
+                detail_count: 0,
+                details: HashMap::new(),
+                cookie: format!("cookie-{}", case.label),
+                username: "operator".to_string(),
+                identity_options: vec!["operator".to_string()],
+                retention_options: vec![RetentionPolicy::OneShot],
+            };
+            let mut prompts = SequencedPrompt::new(case.responses);
+
+            let outcome = runtime.authenticate_active_request_with_prompts(&active, &mut prompts);
+            assert_eq!(outcome, case.expected_outcome, "case {}", case.label);
+            assert_eq!(
+                prompts.success_count, case.expected_success_count,
+                "case {}",
+                case.label
+            );
+            assert_eq!(
+                prompts.failure_messages.len(),
+                case.expected_failure_count,
+                "case {}",
+                case.label
+            );
+
+            server.join().expect("server join");
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[test]
     fn render_prompt_context_includes_policy_details() {
         let mut details = HashMap::new();
         details.insert("vendor".to_string(), "Gardesk".to_string());
@@ -2039,8 +2174,11 @@ mod tests {
             retention_options: vec![RetentionPolicy::OneShot],
         };
 
-        let outcome =
-            runtime.finalize_auth_attempt(&request, HelperOutcome::Denied, Some(RetentionPolicy::OneShot));
+        let outcome = runtime.finalize_auth_attempt(
+            &request,
+            HelperOutcome::Denied,
+            Some(RetentionPolicy::OneShot),
+        );
         assert_eq!(outcome, HelperOutcome::Denied);
 
         let summary = auth_state.summary();
