@@ -18,6 +18,9 @@ pub trait AuthAgentBackend {
     fn name(&self) -> &'static str;
     fn register(&mut self) -> Result<()>;
     fn unregister(&mut self) -> Result<()>;
+    fn has_active_auth(&self) -> bool {
+        false
+    }
     fn maintain(&mut self) -> Result<()> {
         Ok(())
     }
@@ -921,6 +924,10 @@ impl AuthAgentBackend for PolkitAgent {
         self.registered = false;
         self.connection = None;
         Ok(())
+    }
+
+    fn has_active_auth(&self) -> bool {
+        self.runtime.has_active_request()
     }
 
     fn maintain(&mut self) -> Result<()> {

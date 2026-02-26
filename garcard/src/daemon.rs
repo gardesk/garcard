@@ -138,6 +138,13 @@ pub async fn run(config: Config) -> Result<()> {
 }
 
 fn reconnect_backend(backend: &mut dyn AuthAgentBackend) -> Result<()> {
+    if backend.has_active_auth() {
+        tracing::warn!(
+            backend = backend.name(),
+            "Skipping backend reconnect while authentication is active"
+        );
+        return Ok(());
+    }
     backend.unregister()?;
     backend.register()?;
     Ok(())
@@ -341,6 +348,7 @@ mod tests {
     struct TrackingBackend {
         unregister_calls: Arc<AtomicUsize>,
         register_calls: Arc<AtomicUsize>,
+        active_auth: bool,
     }
 
     impl AuthAgentBackend for TrackingBackend {
@@ -357,6 +365,10 @@ mod tests {
             self.unregister_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
+
+        fn has_active_auth(&self) -> bool {
+            self.active_auth
+        }
     }
 
     #[test]
@@ -366,11 +378,27 @@ mod tests {
         let mut backend = TrackingBackend {
             unregister_calls: Arc::clone(&unregister_calls),
             register_calls: Arc::clone(&register_calls),
+            active_auth: false,
         };
 
         reconnect_backend(&mut backend).expect("reconnect");
         assert_eq!(unregister_calls.load(Ordering::Relaxed), 1);
         assert_eq!(register_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reconnect_backend_skips_when_authentication_is_active() {
+        let unregister_calls = Arc::new(AtomicUsize::new(0));
+        let register_calls = Arc::new(AtomicUsize::new(0));
+        let mut backend = TrackingBackend {
+            unregister_calls: Arc::clone(&unregister_calls),
+            register_calls: Arc::clone(&register_calls),
+            active_auth: true,
+        };
+
+        reconnect_backend(&mut backend).expect("reconnect should be skipped");
+        assert_eq!(unregister_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(register_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
