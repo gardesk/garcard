@@ -62,6 +62,7 @@ pub trait PromptProvider {
 pub struct HelperSocketClient {
     socket_path: PathBuf,
     pinned_protocol: Arc<Mutex<Option<HelperSocketProtocol>>>,
+    prefer_direct_transport: Arc<Mutex<bool>>,
 }
 
 impl Default for HelperSocketClient {
@@ -69,6 +70,7 @@ impl Default for HelperSocketClient {
         Self {
             socket_path: PathBuf::from(DEFAULT_HELPER_SOCKET),
             pinned_protocol: Arc::new(Mutex::new(None)),
+            prefer_direct_transport: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -78,6 +80,7 @@ impl HelperSocketClient {
         Self {
             socket_path: path.into(),
             pinned_protocol: Arc::new(Mutex::new(None)),
+            prefer_direct_transport: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -95,10 +98,11 @@ impl HelperSocketClient {
             env_key = HELPER_TRANSPORT_ENV,
             "Selected polkit helper transport mode"
         );
+        let direct_helper = resolve_direct_helper_path();
         if matches!(transport, HelperTransportMode::Direct) {
-            if let Some(helper) = resolve_direct_helper_path() {
+            if let Some(helper) = direct_helper.as_deref() {
                 return self.authenticate_via_helper_process_with_helper(
-                    &helper,
+                    helper,
                     &username_line,
                     &cookie_line,
                     prompts,
@@ -110,9 +114,12 @@ impl HelperSocketClient {
         }
 
         match helper_socket_protocol() {
-            HelperSocketProtocol::Auto => {
-                self.authenticate_via_socket_auto(&username_line, &cookie_line, prompts)
-            }
+            HelperSocketProtocol::Auto => self.authenticate_auto_transport(
+                &username_line,
+                &cookie_line,
+                prompts,
+                direct_helper.as_deref(),
+            ),
             protocol => {
                 match self.authenticate_via_socket(&username_line, &cookie_line, prompts, protocol)
                 {
@@ -129,11 +136,46 @@ impl HelperSocketClient {
         }
     }
 
+    fn authenticate_auto_transport<P: PromptProvider>(
+        &self,
+        username: &str,
+        cookie: &str,
+        prompts: &mut P,
+        direct_helper: Option<&Path>,
+    ) -> Result<HelperOutcome> {
+        if self.direct_transport_preferred() {
+            if let Some(helper) = direct_helper {
+                tracing::debug!(
+                    helper = %helper.display(),
+                    "Using preferred direct helper transport for authentication"
+                );
+                match self
+                    .authenticate_via_helper_process_with_helper(helper, username, cookie, prompts)
+                {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(err) => {
+                        self.set_direct_transport_preferred(false);
+                        tracing::warn!(
+                            helper = %helper.display(),
+                            error = %err,
+                            "Preferred direct helper transport failed; falling back to socket auto negotiation"
+                        );
+                    }
+                }
+            } else {
+                self.set_direct_transport_preferred(false);
+            }
+        }
+
+        self.authenticate_via_socket_auto(username, cookie, prompts, direct_helper)
+    }
+
     fn authenticate_via_socket_auto<P: PromptProvider>(
         &self,
         username: &str,
         cookie: &str,
         prompts: &mut P,
+        direct_helper: Option<&Path>,
     ) -> Result<HelperOutcome> {
         let mut protocols = Vec::new();
         let pinned = self.pinned_socket_protocol();
@@ -172,6 +214,17 @@ impl HelperSocketClient {
             }
         }
 
+        if let Some(helper) = direct_helper {
+            tracing::warn!(
+                helper = %helper.display(),
+                "Socket helper auto negotiation exhausted; falling back to direct helper transport"
+            );
+            let outcome = self
+                .authenticate_via_helper_process_with_helper(helper, username, cookie, prompts)?;
+            self.set_direct_transport_preferred(true);
+            return Ok(outcome);
+        }
+
         prompts
             .auth_failed("Authentication failed")
             .context("prompt failure callback failed")?;
@@ -186,11 +239,25 @@ impl HelperSocketClient {
         if let Ok(mut pinned) = self.pinned_protocol.lock() {
             *pinned = Some(protocol);
         }
+        self.set_direct_transport_preferred(false);
     }
 
     fn clear_pinned_socket_protocol(&self) {
         if let Ok(mut pinned) = self.pinned_protocol.lock() {
             *pinned = None;
+        }
+    }
+
+    fn direct_transport_preferred(&self) -> bool {
+        self.prefer_direct_transport
+            .lock()
+            .map(|preferred| *preferred)
+            .unwrap_or(false)
+    }
+
+    fn set_direct_transport_preferred(&self, preferred: bool) {
+        if let Ok(mut current) = self.prefer_direct_transport.lock() {
+            *current = preferred;
         }
     }
 
@@ -337,12 +404,14 @@ impl HelperSocketClient {
                                 helper = %helper.display(),
                                 "Socket helper reported no session for cookie; falling back to direct helper process"
                             );
-                            return self.authenticate_via_helper_process_with_helper(
+                            let outcome = self.authenticate_via_helper_process_with_helper(
                                 &helper,
                                 &username_line,
                                 &cookie_line,
                                 prompts,
-                            );
+                            )?;
+                            self.set_direct_transport_preferred(true);
+                            return Ok(outcome);
                         }
                         return Err(NoSessionForCookieError.into());
                     }
@@ -758,6 +827,18 @@ mod tests {
         ))
     }
 
+    fn temp_helper_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "garcard-polkit-helper-script-{}-{}.sh",
+            std::process::id(),
+            nanos
+        ))
+    }
+
     #[test]
     fn parse_helper_prompt_lines() {
         assert_eq!(
@@ -1092,6 +1173,81 @@ mod tests {
         assert_eq!(lines[2], "alice");
 
         let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn helper_client_socket_pin_clears_direct_transport_preference() {
+        let client = HelperSocketClient::new(temp_socket_path());
+        assert!(!client.direct_transport_preferred());
+        client.set_direct_transport_preferred(true);
+        assert!(client.direct_transport_preferred());
+
+        client.pin_socket_protocol(HelperSocketProtocol::UsernameCookie);
+        assert_eq!(
+            client.pinned_socket_protocol(),
+            Some(HelperSocketProtocol::UsernameCookie)
+        );
+        assert!(!client.direct_transport_preferred());
+    }
+
+    #[test]
+    fn helper_client_auto_mode_falls_back_to_direct_transport_when_socket_exhausts() {
+        let socket_path = temp_socket_path();
+        let helper_path = temp_helper_path();
+        let helper_script = r#"#!/usr/bin/env bash
+echo "PAM_PROMPT_ECHO_OFF Password:"
+read -r _response
+echo "SUCCESS"
+"#;
+        std::fs::write(&helper_path, helper_script).expect("write fake helper script");
+        let mut perms = std::fs::metadata(&helper_path)
+            .expect("helper metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&helper_path, perms).expect("set helper executable");
+
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let read_stream = stream.try_clone().expect("clone");
+                let mut reader = BufReader::new(read_stream);
+
+                let mut first_line = String::new();
+                reader.read_line(&mut first_line).expect("read first line");
+                if first_line.trim() == "alice" {
+                    let mut cookie = String::new();
+                    reader.read_line(&mut cookie).expect("read cookie");
+                }
+
+                stream
+                    .write_all(b"polkit-agent-helper-1: error response to PolicyKit daemon: GDBus.Error:org.freedesktop.PolicyKit1.Error.Failed: No session for cookie\n")
+                    .expect("write no-session error");
+                stream.write_all(b"FAILURE\n").expect("write failure");
+                stream.flush().expect("flush failure");
+            }
+        });
+
+        let client = HelperSocketClient::new(&socket_path);
+        let mut prompts = FakePrompt {
+            secret_response: PromptResponse::Submitted("correct horse".to_string()),
+            ..FakePrompt::default()
+        };
+        let outcome = client
+            .authenticate_via_socket_auto(
+                "alice",
+                "cookie-direct",
+                &mut prompts,
+                Some(&helper_path),
+            )
+            .expect("authenticate via socket auto with direct fallback");
+        assert_eq!(outcome, HelperOutcome::Authorized);
+        assert!(client.direct_transport_preferred());
+        assert_eq!(prompts.success_count, 1);
+
+        server.join().expect("server join");
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&helper_path);
     }
 
     #[test]
