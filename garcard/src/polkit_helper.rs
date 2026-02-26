@@ -91,30 +91,58 @@ impl HelperSocketClient {
         cookie: &str,
         prompts: &mut P,
     ) -> Result<HelperOutcome> {
+        let username_line = sanitize_control_line(username);
+        let cookie_line = sanitize_control_line(cookie);
         let conversation_backend = helper_conversation_backend();
         tracing::debug!(
             backend = %conversation_backend.as_str(),
             env_key = HELPER_CONVERSATION_BACKEND_ENV,
             "Selected polkit helper conversation backend"
         );
-        match conversation_backend {
-            HelperConversationBackend::Auto | HelperConversationBackend::HelperProtocol => {
-                self.authenticate_with_helper_protocol(username, cookie, prompts)
+        self.authenticate_with_backend(&username_line, &cookie_line, prompts, conversation_backend)
+    }
+
+    fn authenticate_with_backend<P: PromptProvider>(
+        &self,
+        username_line: &str,
+        cookie_line: &str,
+        prompts: &mut P,
+        backend: HelperConversationBackend,
+    ) -> Result<HelperOutcome> {
+        match backend {
+            HelperConversationBackend::HelperProtocol => {
+                self.authenticate_with_helper_protocol(username_line, cookie_line, prompts)
             }
             HelperConversationBackend::SessionApi => {
-                self.authenticate_via_session_api(username, cookie, prompts)
+                self.authenticate_via_session_api(username_line, cookie_line, prompts)
+            }
+            HelperConversationBackend::Auto => {
+                match self.authenticate_via_session_api(username_line, cookie_line, prompts) {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(err) if is_session_api_unavailable_error(&err) => {
+                        tracing::debug!(
+                            error = %err,
+                            "Session-api conversation backend unavailable; falling back to helper protocol backend"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "Session-api conversation backend failed; falling back to helper protocol backend"
+                        );
+                    }
+                }
+                self.authenticate_with_helper_protocol(username_line, cookie_line, prompts)
             }
         }
     }
 
     fn authenticate_with_helper_protocol<P: PromptProvider>(
         &self,
-        username: &str,
-        cookie: &str,
+        username_line: &str,
+        cookie_line: &str,
         prompts: &mut P,
     ) -> Result<HelperOutcome> {
-        let username_line = sanitize_control_line(username);
-        let cookie_line = sanitize_control_line(cookie);
         let transport = helper_transport_mode();
         tracing::debug!(
             transport = %transport.as_str(),
@@ -161,11 +189,22 @@ impl HelperSocketClient {
 
     fn authenticate_via_session_api<P: PromptProvider>(
         &self,
-        _username: &str,
-        _cookie: &str,
-        _prompts: &mut P,
+        username_line: &str,
+        cookie_line: &str,
+        prompts: &mut P,
     ) -> Result<HelperOutcome> {
-        anyhow::bail!("session-api helper conversation backend is not yet implemented");
+        let helper = resolve_direct_helper_path()
+            .ok_or_else(|| anyhow::Error::new(SessionApiUnavailableError))?;
+        tracing::debug!(
+            helper = %helper.display(),
+            "Using session-api conversation backend via direct helper process"
+        );
+        self.authenticate_via_helper_process_with_helper(
+            &helper,
+            username_line,
+            cookie_line,
+            prompts,
+        )
     }
 
     fn authenticate_auto_transport<P: PromptProvider>(
@@ -612,6 +651,23 @@ fn is_no_initial_helper_response_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<NoInitialHelperResponseError>().is_some()
 }
 
+#[derive(Debug)]
+struct SessionApiUnavailableError;
+
+impl std::fmt::Display for SessionApiUnavailableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "session-api helper conversation backend unavailable: no root setuid helper found",
+        )
+    }
+}
+
+impl std::error::Error for SessionApiUnavailableError {}
+
+fn is_session_api_unavailable_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<SessionApiUnavailableError>().is_some()
+}
+
 fn write_line(stream: &mut impl Write, value: &str) -> Result<()> {
     stream.write_all(value.as_bytes())?;
     stream.write_all(b"\n")?;
@@ -1003,16 +1059,65 @@ mod tests {
     }
 
     #[test]
-    fn session_backend_reports_not_implemented() {
+    fn session_backend_reports_unavailable_without_setuid_helper() {
         let client = HelperSocketClient::new(temp_socket_path());
         let mut prompts = FakePrompt::default();
         let err = client
             .authenticate_via_session_api("alice", "cookie-session", &mut prompts)
-            .expect_err("session backend should be unimplemented");
+            .expect_err("session backend should be unavailable");
         assert!(
             err.to_string()
-                .contains("session-api helper conversation backend is not yet implemented")
+                .contains("session-api helper conversation backend unavailable")
         );
+    }
+
+    #[test]
+    fn auto_backend_falls_back_to_helper_protocol_when_session_unavailable() {
+        let socket_path = temp_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let read_stream = stream.try_clone().expect("clone");
+            let mut reader = BufReader::new(read_stream);
+
+            let mut first_line = String::new();
+            reader.read_line(&mut first_line).expect("read first line");
+            if first_line.trim() == "alice" {
+                let mut cookie = String::new();
+                reader.read_line(&mut cookie).expect("read cookie");
+            }
+
+            stream
+                .write_all(b"PAM_PROMPT_ECHO_OFF Password:\n")
+                .expect("write prompt");
+            stream.flush().expect("flush prompt");
+
+            let mut secret = String::new();
+            reader.read_line(&mut secret).expect("read secret");
+            stream.write_all(b"SUCCESS\n").expect("write success");
+            stream.flush().expect("flush success");
+        });
+
+        let client = HelperSocketClient::new(&socket_path);
+        let mut prompts = FakePrompt {
+            secret_response: PromptResponse::Submitted("correct horse".to_string()),
+            ..FakePrompt::default()
+        };
+
+        let outcome = client
+            .authenticate_with_backend(
+                "alice",
+                "cookie-auto-fallback",
+                &mut prompts,
+                HelperConversationBackend::Auto,
+            )
+            .expect("auto backend fallback should succeed");
+        assert_eq!(outcome, HelperOutcome::Authorized);
+        assert_eq!(prompts.success_count, 1);
+
+        server.join().expect("server join");
+        let _ = std::fs::remove_file(&socket_path);
     }
 
     #[test]
