@@ -561,69 +561,21 @@ impl PromptDialog {
     }
 
     fn handle_key(&mut self, key_event: &KeyEvent) {
-        if self.request.feedback_only {
-            // Feedback dialogs are transient; ignore keypresses so the submit key
-            // from the previous prompt cannot dismiss success/error feedback early.
-            return;
-        }
-
-        match key_event.key {
-            Key::Escape => {
-                self.exit = Some(PromptExit::Canceled);
-            }
-            Key::Return => {
-                let submitted = std::mem::take(&mut self.input);
-                self.cursor = 0;
-                self.exit = Some(PromptExit::Submitted(submitted));
-            }
-            Key::Left => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                }
-            }
-            Key::Right => {
-                if self.cursor < self.input.chars().count() {
-                    self.cursor += 1;
-                }
-            }
-            Key::Home => {
-                self.cursor = 0;
-            }
-            Key::End => {
-                self.cursor = self.input.chars().count();
-            }
-            Key::Backspace => {
-                remove_char_before(&mut self.input, &mut self.cursor);
-            }
-            Key::Delete => {
-                remove_char_at(&mut self.input, self.cursor);
-            }
-            Key::Space => {
-                if key_event.modifiers.is_empty() || key_event.modifiers.shift {
-                    insert_char_at(&mut self.input, self.cursor, ' ');
-                    self.cursor += 1;
-                }
-            }
-            Key::Char(ch) => {
-                if key_event.modifiers.ctrl
-                    || key_event.modifiers.alt
-                    || key_event.modifiers.super_key
-                {
-                    return;
-                }
-                let resolved = self
-                    .keymap
-                    .as_ref()
-                    .and_then(|keymap| keymap.char_for_event(key_event))
-                    .unwrap_or(ch);
-                if resolved.is_control() {
-                    return;
-                }
-                insert_char_at(&mut self.input, self.cursor, resolved);
-                self.cursor += 1;
-            }
-            _ => {}
-        }
+        let resolved_char = if matches!(key_event.key, Key::Char(_)) {
+            self.keymap
+                .as_ref()
+                .and_then(|keymap| keymap.char_for_event(key_event))
+        } else {
+            None
+        };
+        apply_key_event(
+            &mut self.input,
+            &mut self.cursor,
+            &mut self.exit,
+            self.request.feedback_only,
+            key_event,
+            resolved_char,
+        );
     }
 
     fn render(&mut self) -> Result<()> {
@@ -816,6 +768,73 @@ fn display_value(input: &str, mode: PromptMode) -> String {
     }
 }
 
+fn apply_key_event(
+    input: &mut String,
+    cursor: &mut usize,
+    exit: &mut Option<PromptExit>,
+    feedback_only: bool,
+    key_event: &KeyEvent,
+    resolved_char: Option<char>,
+) {
+    if feedback_only {
+        // Feedback dialogs are transient; ignore keypresses so submit/escape
+        // from the previous prompt cannot dismiss success/error feedback early.
+        return;
+    }
+
+    match key_event.key {
+        Key::Escape => {
+            *exit = Some(PromptExit::Canceled);
+        }
+        Key::Return => {
+            let submitted = std::mem::take(input);
+            *cursor = 0;
+            *exit = Some(PromptExit::Submitted(submitted));
+        }
+        Key::Left => {
+            if *cursor > 0 {
+                *cursor -= 1;
+            }
+        }
+        Key::Right => {
+            if *cursor < input.chars().count() {
+                *cursor += 1;
+            }
+        }
+        Key::Home => {
+            *cursor = 0;
+        }
+        Key::End => {
+            *cursor = input.chars().count();
+        }
+        Key::Backspace => {
+            remove_char_before(input, cursor);
+        }
+        Key::Delete => {
+            remove_char_at(input, *cursor);
+        }
+        Key::Space => {
+            if key_event.modifiers.is_empty() || key_event.modifiers.shift {
+                insert_char_at(input, *cursor, ' ');
+                *cursor += 1;
+            }
+        }
+        Key::Char(ch) => {
+            if key_event.modifiers.ctrl || key_event.modifiers.alt || key_event.modifiers.super_key
+            {
+                return;
+            }
+            let resolved = resolved_char.unwrap_or(ch);
+            if resolved.is_control() {
+                return;
+            }
+            insert_char_at(input, *cursor, resolved);
+            *cursor += 1;
+        }
+        _ => {}
+    }
+}
+
 fn display_prefix(input: &str, cursor: usize, mode: PromptMode) -> String {
     let prefix = prefix_chars(input, cursor);
     match mode {
@@ -873,6 +892,16 @@ fn scrub_string(value: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gartk_core::Modifiers;
+
+    fn key_event(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            keycode: 0,
+            modifiers: Modifiers::NONE,
+            pressed: true,
+        }
+    }
 
     #[test]
     fn display_value_masks_secret_text() {
@@ -948,5 +977,127 @@ mod tests {
         let spanish = PromptStrings::for_locale("es_ES.UTF-8");
         assert_eq!(spanish.label_password, "Contrasena");
         assert_eq!(spanish.footer_wait, "Espere");
+    }
+
+    #[test]
+    fn apply_key_event_submits_and_clears_input_on_return() {
+        let mut input = "secret".to_string();
+        let mut cursor = input.chars().count();
+        let mut exit = None;
+
+        apply_key_event(
+            &mut input,
+            &mut cursor,
+            &mut exit,
+            false,
+            &key_event(Key::Return),
+            None,
+        );
+
+        assert_eq!(cursor, 0);
+        assert!(input.is_empty());
+        assert_eq!(exit, Some(PromptExit::Submitted("secret".to_string())));
+    }
+
+    #[test]
+    fn apply_key_event_ignores_keys_for_feedback_only_dialogs() {
+        let mut input = "ok".to_string();
+        let mut cursor = 1;
+        let mut exit = None;
+
+        apply_key_event(
+            &mut input,
+            &mut cursor,
+            &mut exit,
+            true,
+            &key_event(Key::Escape),
+            None,
+        );
+
+        assert_eq!(input, "ok");
+        assert_eq!(cursor, 1);
+        assert!(exit.is_none());
+    }
+
+    #[test]
+    fn apply_key_event_respects_navigation_and_edit_shortcuts() {
+        let mut input = "abcd".to_string();
+        let mut cursor = 2;
+        let mut exit = None;
+
+        apply_key_event(
+            &mut input,
+            &mut cursor,
+            &mut exit,
+            false,
+            &key_event(Key::Left),
+            None,
+        );
+        assert_eq!(cursor, 1);
+
+        apply_key_event(
+            &mut input,
+            &mut cursor,
+            &mut exit,
+            false,
+            &key_event(Key::Backspace),
+            None,
+        );
+        assert_eq!(input, "bcd");
+        assert_eq!(cursor, 0);
+
+        apply_key_event(
+            &mut input,
+            &mut cursor,
+            &mut exit,
+            false,
+            &key_event(Key::End),
+            None,
+        );
+        assert_eq!(cursor, 3);
+
+        apply_key_event(
+            &mut input,
+            &mut cursor,
+            &mut exit,
+            false,
+            &key_event(Key::Delete),
+            None,
+        );
+        assert_eq!(input, "bcd");
+
+        apply_key_event(
+            &mut input,
+            &mut cursor,
+            &mut exit,
+            false,
+            &key_event(Key::Home),
+            None,
+        );
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn apply_key_event_ignores_ctrl_shortcuts_and_control_chars() {
+        let mut input = String::new();
+        let mut cursor = 0;
+        let mut exit = None;
+
+        let mut ctrl_event = key_event(Key::Char('x'));
+        ctrl_event.modifiers.ctrl = true;
+        apply_key_event(&mut input, &mut cursor, &mut exit, false, &ctrl_event, None);
+        assert!(input.is_empty());
+        assert_eq!(cursor, 0);
+
+        apply_key_event(
+            &mut input,
+            &mut cursor,
+            &mut exit,
+            false,
+            &key_event(Key::Char('a')),
+            Some('\n'),
+        );
+        assert!(input.is_empty());
+        assert_eq!(cursor, 0);
     }
 }
