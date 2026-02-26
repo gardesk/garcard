@@ -4,7 +4,10 @@
 1. Polkit authentication agent backend with queue-aware auth state tracking.
 2. Built-in gartk prompt path with timeout/cancel behavior and ask-password fallback.
 3. Daemon health/reconnect loop with forced reconnect support (`SIGHUP` + maintenance pass).
-4. `garcardctl` operational commands: `ping`, `status`, `version`, `auth-summary`, `quit`.
+4. Lifecycle controls in `garcardctl`: `ping`, `status`, `diagnose`, `version`, `auth-summary`, `temp-list`, `temp-revoke`, `temp-revoke-all`, `quit`.
+5. Session helper child lifecycle handling and improved helper-protocol fallback behavior.
+6. Auth lifecycle metadata and retention mapping exposed via `auth-summary`.
+7. Status health surface now includes authority connectivity and subject-kind fields for control-surface consumers.
 
 ## Hardening Included In Sprint 04
 1. Same-UID enforcement for local IPC control clients.
@@ -25,8 +28,15 @@
    - `examples/validate-sprint-04.sh`
    - `examples/validate-sprint-04-runtime.sh`
    - `examples/sprint-04-validation.md`
+4. Sprint 07 authorization lifecycle coverage:
+   - `examples/validate-sprint-07.sh`
+   - `examples/sprint-07-validation.md`
+5. Sprint 08 parity matrix scaffolding:
+   - `examples/sprint-08-parity-matrix.md`
+   - `examples/validate-sprint-08-parity.sh`
 
-## Known Limitations
+## Explicit Out-Of-Scope For 0.1.0
 1. Challenge prompting depends on host polkit policy; some actions may auto-authorize.
 2. Scope is logged-in user sessions (X11), not greeter/session-manager flows.
-3. Full panel controls in `gargears` remain limited to discovery/visibility for now.
+3. `gargears` integration is limited to command/control-surface parity contracts; native UI parity is tracked separately.
+4. Multi-seat/remote-session policy nuances are not fully certified in this release cycle.

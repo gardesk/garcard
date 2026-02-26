@@ -79,6 +79,8 @@ gartk prompt path with a persistent in-process modal session and falls back to
 1. `docs/runbooks/migrate-from-external-agent.md`
 2. `docs/runbooks/incident-triage.md`
 3. `docs/runbooks/garcardctl-cookbook.md`
+4. `docs/runbooks/rollback-plan.md`
+5. `docs/release/ga-checklist.md`
 
 ## Known Limitations
 1. Policy results are host-specific; some actions may auto-authorize and not trigger prompts.
