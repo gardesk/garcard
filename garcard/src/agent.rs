@@ -55,6 +55,7 @@ pub struct PolkitBackendConfig {
 
 type Subject = (String, HashMap<String, OwnedValue>);
 type Details = HashMap<String, String>;
+type TemporaryAuthorization = (String, String, Subject, u64, u64);
 const DEFAULT_AUTH_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_IDENTITY_SELECTION_ATTEMPTS: usize = 3;
 const DEFAULT_RETENTION_SELECTION_ATTEMPTS: usize = 3;
@@ -394,11 +395,15 @@ impl PolkitRuntime {
         let max_attempts = auth_max_attempts();
         let username = match select_identity_for_request(request, prompts) {
             IdentitySelection::Selected(selected) => selected,
-            IdentitySelection::Terminal(outcome) => return outcome,
+            IdentitySelection::Terminal(outcome) => {
+                return self.finalize_auth_attempt(request, outcome, None);
+            }
         };
         let retention = match select_retention_for_request(request, prompts) {
             RetentionSelection::Selected(selected) => selected,
-            RetentionSelection::Terminal(outcome) => return outcome,
+            RetentionSelection::Terminal(outcome) => {
+                return self.finalize_auth_attempt(request, outcome, None);
+            }
         };
         tracing::info!(
             action_id = %request.action_id,
@@ -412,7 +417,7 @@ impl PolkitRuntime {
                     action_id = %request.action_id,
                     "Authentication request canceled before helper attempt"
                 );
-                return HelperOutcome::Canceled;
+                return self.finalize_auth_attempt(request, HelperOutcome::Canceled, Some(retention));
             }
             tracing::info!(
                 context = %prompt_context,
@@ -432,7 +437,11 @@ impl PolkitRuntime {
                         action_id = %request.action_id,
                         "Authentication request canceled during helper attempt"
                     );
-                    return HelperOutcome::Canceled;
+                    return self.finalize_auth_attempt(
+                        request,
+                        HelperOutcome::Canceled,
+                        Some(retention),
+                    );
                 }
                 Ok(HelperOutcome::Denied) if attempt < max_attempts => {
                     prompts.on_retry();
@@ -445,7 +454,9 @@ impl PolkitRuntime {
                     );
                     continue;
                 }
-                Ok(outcome) => return outcome,
+                Ok(outcome) => {
+                    return self.finalize_auth_attempt(request, outcome, Some(retention));
+                }
                 Err(err) => {
                     tracing::warn!(
                         action_id = %request.action_id,
@@ -459,12 +470,71 @@ impl PolkitRuntime {
                         self.auth_state.set_phase(AuthPhase::PendingPrompt);
                         continue;
                     }
-                    return HelperOutcome::Denied;
+                    return self.finalize_auth_attempt(
+                        request,
+                        HelperOutcome::Denied,
+                        Some(retention),
+                    );
                 }
             }
         }
 
-        HelperOutcome::Denied
+        self.finalize_auth_attempt(request, HelperOutcome::Denied, Some(retention))
+    }
+
+    fn finalize_auth_attempt(
+        &self,
+        request: &ActiveRequest,
+        outcome: HelperOutcome,
+        retention: Option<RetentionPolicy>,
+    ) -> HelperOutcome {
+        let retention_enforced = self.enforce_retention_policy(request, outcome, retention);
+        self.auth_state.set_last_decision(
+            request.action_id.clone(),
+            helper_outcome_label(outcome),
+            retention.map(|policy| policy.label().to_string()),
+            retention_enforced,
+        );
+        outcome
+    }
+
+    fn enforce_retention_policy(
+        &self,
+        request: &ActiveRequest,
+        outcome: HelperOutcome,
+        retention: Option<RetentionPolicy>,
+    ) -> bool {
+        if outcome != HelperOutcome::Authorized {
+            return false;
+        }
+        let Some(retention) = retention else {
+            return false;
+        };
+        if retention != RetentionPolicy::OneShot {
+            return false;
+        }
+        if request.retention_options.len() <= 1 {
+            return false;
+        }
+
+        match revoke_temporary_authorizations_for_action(&request.action_id) {
+            Ok(revoked) => {
+                tracing::info!(
+                    action_id = %request.action_id,
+                    revoked_count = revoked,
+                    "Applied one-shot retention policy by revoking temporary authorizations"
+                );
+                true
+            }
+            Err(err) => {
+                tracing::warn!(
+                    action_id = %request.action_id,
+                    error = %err,
+                    "Failed to enforce one-shot retention policy"
+                );
+                false
+            }
+        }
     }
 
     fn complete_request(&self, cookie: &str, outcome: HelperOutcome) {
@@ -574,6 +644,35 @@ impl PolkitRuntime {
         self.auth_state.set_phase(AuthPhase::Idle);
         self.auth_state.sync_queue_counts(0, 0);
     }
+}
+
+fn helper_outcome_label(outcome: HelperOutcome) -> &'static str {
+    match outcome {
+        HelperOutcome::Authorized => "success",
+        HelperOutcome::Denied => "failure",
+        HelperOutcome::Canceled => "canceled",
+        HelperOutcome::Timeout => "timeout",
+    }
+}
+
+fn revoke_temporary_authorizations_for_action(action_id: &str) -> Result<usize> {
+    let connection = Connection::system().context("failed to connect to system bus")?;
+    let subject = build_subject();
+    let proxy = PolkitAgent::proxy(&connection)?;
+    let authorizations: Vec<TemporaryAuthorization> =
+        proxy.call("EnumerateTemporaryAuthorizations", &subject)?;
+
+    let mut revoked = 0_usize;
+    for (authorization_id, auth_action_id, _subject, _obtained, _expires) in authorizations {
+        if auth_action_id != action_id {
+            continue;
+        }
+
+        let _: () = proxy.call("RevokeTemporaryAuthorizationById", &authorization_id)?;
+        revoked += 1;
+    }
+
+    Ok(revoked)
 }
 
 fn render_prompt_context(request: &ActiveRequest) -> String {
@@ -1895,6 +1994,14 @@ mod tests {
     }
 
     #[test]
+    fn helper_outcome_label_maps_outcomes() {
+        assert_eq!(helper_outcome_label(HelperOutcome::Authorized), "success");
+        assert_eq!(helper_outcome_label(HelperOutcome::Denied), "failure");
+        assert_eq!(helper_outcome_label(HelperOutcome::Canceled), "canceled");
+        assert_eq!(helper_outcome_label(HelperOutcome::Timeout), "timeout");
+    }
+
+    #[test]
     fn select_retention_for_request_uses_prompted_choice() {
         let request = ActiveRequest {
             action_id: "org.gardesk.test".to_string(),
@@ -1914,6 +2021,33 @@ mod tests {
             selection,
             RetentionSelection::Selected(RetentionPolicy::Session)
         ));
+    }
+
+    #[test]
+    fn finalize_auth_attempt_records_retention_in_auth_summary() {
+        let auth_state = Arc::new(AuthState::default());
+        let runtime = PolkitRuntime::new_without_worker(Arc::clone(&auth_state));
+        let request = ActiveRequest {
+            action_id: "org.gardesk.test".to_string(),
+            message: "Authenticate".to_string(),
+            icon_name: "dialog-password".to_string(),
+            detail_count: 0,
+            details: HashMap::new(),
+            cookie: "cookie-finalize".to_string(),
+            username: "operator".to_string(),
+            identity_options: vec!["operator".to_string()],
+            retention_options: vec![RetentionPolicy::OneShot],
+        };
+
+        let outcome =
+            runtime.finalize_auth_attempt(&request, HelperOutcome::Denied, Some(RetentionPolicy::OneShot));
+        assert_eq!(outcome, HelperOutcome::Denied);
+
+        let summary = auth_state.summary();
+        assert_eq!(summary.last_action_id.as_deref(), Some("org.gardesk.test"));
+        assert_eq!(summary.last_outcome.as_deref(), Some("failure"));
+        assert_eq!(summary.last_retention_policy.as_deref(), Some("one-shot"));
+        assert_eq!(summary.last_retention_enforced, Some(false));
     }
 
     #[test]

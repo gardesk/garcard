@@ -67,6 +67,7 @@ pub struct AuthState {
     current_phase: RwLock<AuthPhase>,
     active_requests: AtomicUsize,
     queued_requests: AtomicUsize,
+    last_decision: RwLock<Option<AuthDecision>>,
 }
 
 impl Default for AuthState {
@@ -75,8 +76,17 @@ impl Default for AuthState {
             current_phase: RwLock::new(AuthPhase::Idle),
             active_requests: AtomicUsize::new(0),
             queued_requests: AtomicUsize::new(0),
+            last_decision: RwLock::new(None),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct AuthDecision {
+    action_id: String,
+    outcome: String,
+    retention_policy: Option<String>,
+    retention_enforced: bool,
 }
 
 impl AuthState {
@@ -120,10 +130,51 @@ impl AuthState {
     }
 
     pub fn summary(&self) -> AuthSummary {
+        let (last_action_id, last_outcome, last_retention_policy, last_retention_enforced) = self
+            .last_decision
+            .read()
+            .ok()
+            .and_then(|decision| decision.clone())
+            .map(|decision| {
+                (
+                    Some(decision.action_id),
+                    Some(decision.outcome),
+                    decision.retention_policy,
+                    Some(decision.retention_enforced),
+                )
+            })
+            .unwrap_or((None, None, None, None));
         AuthSummary {
             state: self.phase().to_string(),
             active_requests: self.active_requests.load(Ordering::Relaxed),
             queued_requests: self.queued_requests.load(Ordering::Relaxed),
+            last_action_id,
+            last_outcome,
+            last_retention_policy,
+            last_retention_enforced,
+        }
+    }
+
+    pub fn set_last_decision(
+        &self,
+        action_id: impl Into<String>,
+        outcome: impl Into<String>,
+        retention_policy: Option<String>,
+        retention_enforced: bool,
+    ) {
+        if let Ok(mut decision) = self.last_decision.write() {
+            *decision = Some(AuthDecision {
+                action_id: action_id.into(),
+                outcome: outcome.into(),
+                retention_policy,
+                retention_enforced,
+            });
+        }
+    }
+
+    pub fn clear_last_decision(&self) {
+        if let Ok(mut decision) = self.last_decision.write() {
+            *decision = None;
         }
     }
 }
@@ -260,6 +311,7 @@ impl RuntimeState {
         auth.set_phase(AuthPhase::Idle);
         auth.set_active_requests(0);
         auth.set_queued_requests(0);
+        auth.clear_last_decision();
         Self {
             started_at: Instant::now(),
             pid: std::process::id(),
@@ -310,6 +362,10 @@ mod tests {
         assert_eq!(summary.state, "idle");
         assert_eq!(summary.active_requests, 0);
         assert_eq!(summary.queued_requests, 0);
+        assert!(summary.last_action_id.is_none());
+        assert!(summary.last_outcome.is_none());
+        assert!(summary.last_retention_policy.is_none());
+        assert!(summary.last_retention_enforced.is_none());
     }
 
     #[test]
@@ -323,6 +379,26 @@ mod tests {
         assert_eq!(summary.state, "verifying");
         assert_eq!(summary.active_requests, 2);
         assert_eq!(summary.queued_requests, 3);
+    }
+
+    #[test]
+    fn auth_state_records_last_decision_context() {
+        let state = AuthState::default();
+        state.set_last_decision(
+            "com.gardesk.install",
+            "success",
+            Some("one-shot".to_string()),
+            true,
+        );
+
+        let summary = state.summary();
+        assert_eq!(
+            summary.last_action_id.as_deref(),
+            Some("com.gardesk.install")
+        );
+        assert_eq!(summary.last_outcome.as_deref(), Some("success"));
+        assert_eq!(summary.last_retention_policy.as_deref(), Some("one-shot"));
+        assert_eq!(summary.last_retention_enforced, Some(true));
     }
 
     #[test]

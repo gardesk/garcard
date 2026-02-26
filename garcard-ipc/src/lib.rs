@@ -86,6 +86,14 @@ pub struct AuthSummary {
     pub state: String,
     pub active_requests: usize,
     pub queued_requests: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_action_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_retention_policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_retention_enforced: Option<bool>,
 }
 
 /// Resolve the daemon socket path from `XDG_RUNTIME_DIR` with `/tmp` fallback.
