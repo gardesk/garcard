@@ -4,6 +4,7 @@ set -euo pipefail
 REPORT_FILE="${GARCARD_SPRINT08_REPORT_FILE:-${PWD}/target/sprint-08-parity-evidence.md}"
 RUN_INTERACTIVE="${GARCARD_SPRINT08_RUN_INTERACTIVE:-0}"
 ACTION_ID="${GARCARD_SPRINT08_ACTION_ID:-com.mesonbuild.install.run}"
+SPRINT07_BASELINE_BACKEND="${GARCARD_SPRINT08_SPRINT07_BASELINE_BACKEND:-stub}"
 
 mkdir -p "$(dirname "${REPORT_FILE}")"
 
@@ -36,7 +37,9 @@ append_section "Sprint 04 Reliability Baseline"
 ./examples/validate-sprint-04.sh | tee -a "${REPORT_FILE}"
 
 append_section "Sprint 07 Lifecycle Baseline (Non-Interactive)"
-GARCARD_SPRINT07_RUN_PKCHECK=0 ./examples/validate-sprint-07.sh | tee -a "${REPORT_FILE}"
+GARCARD_SPRINT07_BACKEND="${SPRINT07_BASELINE_BACKEND}" \
+  GARCARD_SPRINT07_RUN_PKCHECK=0 \
+  ./examples/validate-sprint-07.sh | tee -a "${REPORT_FILE}"
 
 if [[ "${RUN_INTERACTIVE}" == "1" ]]; then
   append_section "Sprint 07 Lifecycle Interactive Loop"

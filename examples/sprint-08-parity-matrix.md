@@ -15,14 +15,17 @@ Use this matrix to certify behavior against mature desktop PolicyKit agents.
 | Timeout path | Set short timeout (`GARCARD_PROMPT_TIMEOUT_SECS=2`), trigger auth, do not respond | Request times out, `auth-summary.last_outcome=timeout` | Pending | daemon log + `garcardctl auth-summary` |
 | Multi-identity flow | Trigger policy requiring identity choice | Identity list rendered, selected identity is honored | Pending | prompt capture + daemon log |
 | Retention choice flow | Trigger policy exposing retention options | Retention choice accepted and recorded in `auth-summary` | Pending | `garcardctl auth-summary` |
-| Temp auth introspection | Run `garcardctl temp-list` after successful retained auth | Active temporary authorization entries are listed | Pending | command output |
-| Temp auth revoke single | Run `garcardctl temp-revoke <id>` | Target authorization removed | Pending | `temp-list` before/after |
-| Temp auth revoke all | Run `garcardctl temp-revoke-all` | All temporary authorizations removed | Pending | `temp-list` before/after |
-| Daemon restart during lifecycle | Restart daemon and rerun status/diag/temp commands | Control plane recovers without stale socket state | Pending | `validate-sprint-07.sh` output |
+| Temp auth introspection | Run `garcardctl temp-list` after successful retained auth | Active temporary authorization entries are listed | PASS (baseline) | `target/sprint-08-parity-evidence.md` (`authorizations: []` in non-interactive baseline) |
+| Temp auth revoke single | Run `garcardctl temp-revoke <id>` | Target authorization removed | Pending interactive retained auth | `temp-list` before/after |
+| Temp auth revoke all | Run `garcardctl temp-revoke-all` | All temporary authorizations removed | PASS (baseline) | `target/sprint-08-parity-evidence.md` (`revoked_count: 0` baseline) |
+| Daemon restart during lifecycle | Restart daemon and rerun status/diag/temp commands | Control plane recovers without stale socket state | PASS (baseline) | `target/sprint-08-parity-evidence.md` (`validate-sprint-07.sh` section) |
 | Polkit restart recovery | Restart polkit and relaunch daemon | Diagnostics recover, control commands remain responsive | Pending | script output + daemon log |
 
 ## Signoff
-1. Date:
-2. Operator:
-3. Result (`PASS`/`FAIL`):
+1. Date: 2026-02-26 (baseline run)
+2. Operator: mfwolffe/codex
+3. Result (`PASS`/`FAIL`): IN PROGRESS
 4. Blocking gaps:
+   - interactive `pkcheck` matrix rows (success/failure/cancel/timeout)
+   - multi-identity and retention-choice scenarios on policies that expose those options
+   - polkit restart recovery check with privileged restart command
