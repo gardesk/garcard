@@ -34,6 +34,15 @@
 5. Sprint 08 parity matrix scaffolding:
    - `examples/sprint-08-parity-matrix.md`
    - `examples/validate-sprint-08-parity.sh`
+6. Sprint 08 parity certification and targeted captures:
+   - `examples/sprint-08-validation-report-2026-02-26.md`
+   - `examples/sprint-08-parity-matrix.md` (`PASS`, blockers: none)
+   - `target/sprint-08-parity-evidence.md`
+
+## GA Gate Summary (2026-02-26)
+1. Release-candidate gate checklist completed: `docs/release/ga-checklist.md`.
+2. Interactive and targeted parity scenarios pass (success/failure/cancel/timeout, multi-identity, retention, temp auth lifecycle).
+3. Integration certification and post-polkit-restart recovery validated in Sprint 08 report.
 
 ## Explicit Out-Of-Scope For 0.1.0
 1. Challenge prompting depends on host polkit policy; some actions may auto-authorize.
