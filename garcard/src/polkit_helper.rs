@@ -3,15 +3,16 @@ use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_HELPER_SOCKET: &str = "/run/polkit/agent-helper.socket";
 const HELPER_TRANSPORT_ENV: &str = "GARCARD_POLKIT_HELPER_TRANSPORT";
 const HELPER_SOCKET_PROTOCOL_ENV: &str = "GARCARD_POLKIT_SOCKET_PROTOCOL";
 const HELPER_CONVERSATION_BACKEND_ENV: &str = "GARCARD_POLKIT_CONVERSATION_BACKEND";
 const SOCKET_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
+const HELPER_EXIT_GRACE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelperOutcome {
@@ -520,10 +521,6 @@ impl HelperSocketClient {
             .stdout
             .take()
             .context("failed to capture helper process stdout")?;
-        let stdin = child
-            .stdin
-            .as_mut()
-            .context("failed to capture helper process stdin")?;
         let mut reader = BufReader::new(stdout);
 
         loop {
@@ -565,13 +562,31 @@ impl HelperSocketClient {
                                 "Submitting secret prompt response to direct helper"
                             );
                             let mut sanitized = sanitize_response(&response);
-                            write_line(stdin, &sanitized)
-                                .context("failed to send direct helper secret response")?;
+                            {
+                                let stdin = child
+                                    .stdin
+                                    .as_mut()
+                                    .context("failed to capture helper process stdin")?;
+                                write_line(stdin, &sanitized)
+                                    .context("failed to send direct helper secret response")?;
+                            }
                             scrub_string(&mut sanitized);
                             scrub_string(&mut response);
                         }
-                        PromptResponse::Canceled => return Ok(HelperOutcome::Canceled),
-                        PromptResponse::TimedOut => return Ok(HelperOutcome::Timeout),
+                        PromptResponse::Canceled => {
+                            return finalize_direct_helper_outcome(
+                                &mut child,
+                                helper,
+                                HelperOutcome::Canceled,
+                            );
+                        }
+                        PromptResponse::TimedOut => {
+                            return finalize_direct_helper_outcome(
+                                &mut child,
+                                helper,
+                                HelperOutcome::Timeout,
+                            );
+                        }
                     }
                 }
                 HelperEvent::PromptVisible(prompt) => {
@@ -585,13 +600,31 @@ impl HelperSocketClient {
                                 "Submitting visible prompt response to direct helper"
                             );
                             let mut sanitized = sanitize_response(&response);
-                            write_line(stdin, &sanitized)
-                                .context("failed to send direct helper visible response")?;
+                            {
+                                let stdin = child
+                                    .stdin
+                                    .as_mut()
+                                    .context("failed to capture helper process stdin")?;
+                                write_line(stdin, &sanitized)
+                                    .context("failed to send direct helper visible response")?;
+                            }
                             scrub_string(&mut sanitized);
                             scrub_string(&mut response);
                         }
-                        PromptResponse::Canceled => return Ok(HelperOutcome::Canceled),
-                        PromptResponse::TimedOut => return Ok(HelperOutcome::Timeout),
+                        PromptResponse::Canceled => {
+                            return finalize_direct_helper_outcome(
+                                &mut child,
+                                helper,
+                                HelperOutcome::Canceled,
+                            );
+                        }
+                        PromptResponse::TimedOut => {
+                            return finalize_direct_helper_outcome(
+                                &mut child,
+                                helper,
+                                HelperOutcome::Timeout,
+                            );
+                        }
                     }
                 }
                 HelperEvent::Error(message) => {
@@ -608,13 +641,21 @@ impl HelperSocketClient {
                     prompts
                         .auth_succeeded()
                         .context("prompt success callback failed")?;
-                    return Ok(HelperOutcome::Authorized);
+                    return finalize_direct_helper_outcome(
+                        &mut child,
+                        helper,
+                        HelperOutcome::Authorized,
+                    );
                 }
                 HelperEvent::Failure => {
                     prompts
                         .auth_failed("Authentication failed")
                         .context("prompt failure callback failed")?;
-                    return Ok(HelperOutcome::Denied);
+                    return finalize_direct_helper_outcome(
+                        &mut child,
+                        helper,
+                        HelperOutcome::Denied,
+                    );
                 }
             }
         }
@@ -672,6 +713,90 @@ fn write_line(stream: &mut impl Write, value: &str) -> Result<()> {
     stream.write_all(value.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
+    Ok(())
+}
+
+fn finalize_direct_helper_outcome(
+    child: &mut Child,
+    helper: &Path,
+    outcome: HelperOutcome,
+) -> Result<HelperOutcome> {
+    match outcome {
+        HelperOutcome::Canceled | HelperOutcome::Timeout => {
+            terminate_direct_helper_process(child, helper, "prompt canceled before completion")?;
+        }
+        HelperOutcome::Authorized | HelperOutcome::Denied => {
+            if let Some(status) = wait_for_helper_exit(child, HELPER_EXIT_GRACE_TIMEOUT)? {
+                tracing::debug!(
+                    helper = %helper.display(),
+                    status = %status,
+                    "Direct helper exited after terminal outcome"
+                );
+            } else {
+                tracing::warn!(
+                    helper = %helper.display(),
+                    grace_ms = HELPER_EXIT_GRACE_TIMEOUT.as_millis(),
+                    "Direct helper did not exit during grace period; terminating process"
+                );
+                terminate_direct_helper_process(
+                    child,
+                    helper,
+                    "helper did not exit after terminal outcome",
+                )?;
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
+fn wait_for_helper_exit(child: &mut Child, timeout: Duration) -> Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll direct helper process state")?
+        {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn terminate_direct_helper_process(child: &mut Child, helper: &Path, reason: &str) -> Result<()> {
+    if child
+        .try_wait()
+        .context("failed to poll direct helper before termination")?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let _ = child.stdin.take();
+    let _ = child.stdout.take();
+    let _ = child.stderr.take();
+    match child.kill() {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::InvalidInput => return Ok(()),
+        Err(err) => {
+            return Err(anyhow::Error::new(err).context(format!(
+                "failed to terminate direct helper process ({})",
+                reason
+            )));
+        }
+    }
+    let status = child
+        .wait()
+        .context("failed waiting for direct helper process termination")?;
+    tracing::debug!(
+        helper = %helper.display(),
+        status = %status,
+        reason,
+        "Terminated direct helper process"
+    );
     Ok(())
 }
 
@@ -1565,6 +1690,55 @@ echo "SUCCESS"
         server.join().expect("server join");
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_file(&helper_path);
+    }
+
+    #[test]
+    fn direct_helper_canceled_prompt_terminates_helper_process() {
+        let helper_path = temp_helper_path();
+        let helper_script = r#"#!/usr/bin/env bash
+pidfile="${0}.pid"
+echo "$$" > "$pidfile"
+echo "PAM_PROMPT_ECHO_OFF Password:"
+read -r _response
+echo "SUCCESS"
+"#;
+        std::fs::write(&helper_path, helper_script).expect("write helper script");
+        let mut perms = std::fs::metadata(&helper_path)
+            .expect("helper metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&helper_path, perms).expect("set helper executable");
+
+        let pid_path = PathBuf::from(format!("{}.pid", helper_path.to_string_lossy()));
+        let client = HelperSocketClient::new(temp_socket_path());
+        let mut prompts = FakePrompt {
+            secret_response: PromptResponse::Canceled,
+            ..FakePrompt::default()
+        };
+
+        let outcome = client
+            .authenticate_via_helper_process_with_helper(
+                &helper_path,
+                "operator",
+                "cookie-cancel",
+                &mut prompts,
+            )
+            .expect("authenticate canceled");
+        assert_eq!(outcome, HelperOutcome::Canceled);
+
+        let helper_pid = std::fs::read_to_string(&pid_path)
+            .expect("read helper pid")
+            .trim()
+            .parse::<u32>()
+            .expect("parse helper pid");
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(
+            !PathBuf::from(format!("/proc/{}", helper_pid)).exists(),
+            "helper process should be terminated after canceled prompt"
+        );
+
+        let _ = std::fs::remove_file(&helper_path);
+        let _ = std::fs::remove_file(&pid_path);
     }
 
     #[test]
