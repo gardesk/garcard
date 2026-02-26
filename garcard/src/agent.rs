@@ -713,7 +713,7 @@ pub fn revoke_all_temporary_authorizations() -> Result<usize> {
     let subject = build_subject();
     let proxy = PolkitAgent::proxy(&connection)?;
     let authorizations: Vec<TemporaryAuthorization> =
-        proxy.call("EnumerateTemporaryAuthorizations", &subject)?;
+        proxy.call("EnumerateTemporaryAuthorizations", &(&subject,))?;
 
     let mut revoked = 0_usize;
     for (authorization_id, _action_id, _subject, _obtained, _expires) in authorizations {
@@ -729,7 +729,7 @@ fn revoke_temporary_authorizations_for_action(action_id: &str) -> Result<usize> 
     let subject = build_subject();
     let proxy = PolkitAgent::proxy(&connection)?;
     let authorizations: Vec<TemporaryAuthorization> =
-        proxy.call("EnumerateTemporaryAuthorizations", &subject)?;
+        proxy.call("EnumerateTemporaryAuthorizations", &(&subject,))?;
 
     let mut revoked = 0_usize;
     for (authorization_id, auth_action_id, _subject, _obtained, _expires) in authorizations {
@@ -817,7 +817,7 @@ fn enumerate_temporary_authorizations_for_subject(
 ) -> Result<Vec<TemporaryAuthorizationRecord>> {
     let proxy = PolkitAgent::proxy(connection)?;
     let authorizations: Vec<TemporaryAuthorization> =
-        proxy.call("EnumerateTemporaryAuthorizations", subject)?;
+        proxy.call("EnumerateTemporaryAuthorizations", &(subject,))?;
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
