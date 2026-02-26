@@ -57,6 +57,7 @@ type Subject = (String, HashMap<String, OwnedValue>);
 type Details = HashMap<String, String>;
 const DEFAULT_AUTH_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_IDENTITY_SELECTION_ATTEMPTS: usize = 3;
+const DEFAULT_RETENTION_SELECTION_ATTEMPTS: usize = 3;
 
 #[derive(Debug)]
 struct AuthRequest {
@@ -78,6 +79,32 @@ struct ActiveRequest {
     cookie: String,
     username: String,
     identity_options: Vec<String>,
+    retention_options: Vec<RetentionPolicy>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetentionPolicy {
+    OneShot,
+    Session,
+    Always,
+}
+
+impl RetentionPolicy {
+    fn label(self) -> &'static str {
+        match self {
+            Self::OneShot => "one-shot",
+            Self::Session => "keep-session",
+            Self::Always => "keep-always",
+        }
+    }
+
+    fn prompt_label(self) -> &'static str {
+        match self {
+            Self::OneShot => "One-shot",
+            Self::Session => "Keep for session",
+            Self::Always => "Keep always",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -332,6 +359,7 @@ impl PolkitRuntime {
         {
             identity_options.insert(0, username.clone());
         }
+        let retention_options = retention_options_from_details(&request.details);
 
         tracing::debug!(
             identity_summary = %summarize_identities(&request.identities),
@@ -348,6 +376,7 @@ impl PolkitRuntime {
             cookie: request.cookie.clone(),
             username,
             identity_options,
+            retention_options,
         })
     }
 
@@ -367,6 +396,15 @@ impl PolkitRuntime {
             IdentitySelection::Selected(selected) => selected,
             IdentitySelection::Terminal(outcome) => return outcome,
         };
+        let retention = match select_retention_for_request(request, prompts) {
+            RetentionSelection::Selected(selected) => selected,
+            RetentionSelection::Terminal(outcome) => return outcome,
+        };
+        tracing::info!(
+            action_id = %request.action_id,
+            retention = retention.label(),
+            "Selected retention policy for authentication request"
+        );
 
         for attempt in 1..=max_attempts {
             if self.is_canceled(&request.cookie) {
@@ -576,6 +614,16 @@ fn render_prompt_context(request: &ActiveRequest) -> String {
         lines.push(format!("Application: {}", application));
     }
 
+    if !request.retention_options.is_empty() {
+        let supported = request
+            .retention_options
+            .iter()
+            .map(|policy| policy.label())
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("Retention options: {}", supported));
+    }
+
     let detail_keys = [
         "program",
         "polkit.exec.path",
@@ -601,6 +649,11 @@ fn render_prompt_context(request: &ActiveRequest) -> String {
 
 enum IdentitySelection {
     Selected(String),
+    Terminal(HelperOutcome),
+}
+
+enum RetentionSelection {
+    Selected(RetentionPolicy),
     Terminal(HelperOutcome),
 }
 
@@ -657,6 +710,62 @@ fn select_identity_for_request<P: PromptProvider>(
     IdentitySelection::Selected(request.username.clone())
 }
 
+fn select_retention_for_request<P: PromptProvider>(
+    request: &ActiveRequest,
+    prompts: &mut P,
+) -> RetentionSelection {
+    if request.retention_options.len() <= 1 {
+        let fallback = request
+            .retention_options
+            .first()
+            .copied()
+            .unwrap_or(RetentionPolicy::OneShot);
+        return RetentionSelection::Selected(fallback);
+    }
+
+    let prompt = render_retention_selection_prompt(request);
+    for attempt in 1..=DEFAULT_RETENTION_SELECTION_ATTEMPTS {
+        match prompts.prompt_plain(&prompt) {
+            Ok(PromptResponse::Submitted(mut raw)) => {
+                if let Some(selected) =
+                    parse_retention_selection(raw.as_str(), &request.retention_options)
+                {
+                    raw.clear();
+                    return RetentionSelection::Selected(selected);
+                }
+
+                raw.clear();
+                let _ = prompts.show_error("Invalid retention selection");
+                if attempt == DEFAULT_RETENTION_SELECTION_ATTEMPTS {
+                    tracing::warn!(
+                        action_id = %request.action_id,
+                        default_retention = RetentionPolicy::OneShot.label(),
+                        "Retention selection failed repeatedly; using default retention"
+                    );
+                    return RetentionSelection::Selected(RetentionPolicy::OneShot);
+                }
+            }
+            Ok(PromptResponse::Canceled) => {
+                return RetentionSelection::Terminal(HelperOutcome::Canceled);
+            }
+            Ok(PromptResponse::TimedOut) => {
+                return RetentionSelection::Terminal(HelperOutcome::Timeout);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    action_id = %request.action_id,
+                    error = %err,
+                    default_retention = RetentionPolicy::OneShot.label(),
+                    "Retention selection prompt failed; using default retention"
+                );
+                return RetentionSelection::Selected(RetentionPolicy::OneShot);
+            }
+        }
+    }
+
+    RetentionSelection::Selected(RetentionPolicy::OneShot)
+}
+
 fn render_identity_selection_prompt(request: &ActiveRequest) -> String {
     let mut lines = vec![
         "Select authentication identity".to_string(),
@@ -691,6 +800,66 @@ fn parse_identity_selection(input: &str, options: &[String], default: &str) -> O
         .cloned()
 }
 
+fn render_retention_selection_prompt(request: &ActiveRequest) -> String {
+    let mut lines = vec![
+        "Select authorization retention".to_string(),
+        format!("Action: {}", request.action_id),
+    ];
+    for (index, option) in request.retention_options.iter().enumerate() {
+        if *option == RetentionPolicy::OneShot {
+            lines.push(format!(
+                "{}: {} (default)",
+                index + 1,
+                option.prompt_label()
+            ));
+        } else {
+            lines.push(format!("{}: {}", index + 1, option.prompt_label()));
+        }
+    }
+    lines.push("Enter number or label (blank for default)".to_string());
+    lines.join("\n")
+}
+
+fn parse_retention_selection(input: &str, options: &[RetentionPolicy]) -> Option<RetentionPolicy> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Some(RetentionPolicy::OneShot);
+    }
+
+    if let Ok(index) = trimmed.parse::<usize>() {
+        if (1..=options.len()).contains(&index) {
+            return options.get(index - 1).copied();
+        }
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    if normalized == "default" || normalized == "one-shot" || normalized == "oneshot" {
+        return Some(RetentionPolicy::OneShot);
+    }
+    if normalized == "session"
+        || normalized == "keep-session"
+        || normalized == "keep for session"
+        || normalized == "session-only"
+    {
+        return options
+            .iter()
+            .copied()
+            .find(|option| *option == RetentionPolicy::Session);
+    }
+    if normalized == "always"
+        || normalized == "keep-always"
+        || normalized == "keep always"
+        || normalized == "persistent"
+    {
+        return options
+            .iter()
+            .copied()
+            .find(|option| *option == RetentionPolicy::Always);
+    }
+
+    None
+}
+
 fn identity_options_from_subjects(identities: &[Subject]) -> Vec<String> {
     let mut options = Vec::new();
     let mut seen = HashSet::new();
@@ -713,6 +882,47 @@ fn identity_options_from_subjects(identities: &[Subject]) -> Vec<String> {
         }
     }
 
+    options
+}
+
+fn retention_options_from_details(details: &Details) -> Vec<RetentionPolicy> {
+    let mut options = vec![RetentionPolicy::OneShot];
+
+    let raw = first_detail_value(
+        details,
+        &[
+            "polkit.retains_authorization_after_challenge",
+            "retains_authorization_after_challenge",
+            "polkit.retention",
+            "retention",
+        ],
+    );
+    let Some(raw) = raw else {
+        return options;
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+
+    if normalized.is_empty()
+        || normalized == "0"
+        || normalized == "false"
+        || normalized == "no"
+        || normalized == "never"
+        || normalized == "none"
+    {
+        return options;
+    }
+
+    if normalized == "always"
+        || normalized == "persistent"
+        || normalized == "keep-always"
+        || normalized == "2"
+    {
+        options.push(RetentionPolicy::Session);
+        options.push(RetentionPolicy::Always);
+        return options;
+    }
+
+    options.push(RetentionPolicy::Session);
     options
 }
 
@@ -1507,6 +1717,7 @@ mod tests {
             cookie: "cookie-1".to_string(),
             username: "operator".to_string(),
             identity_options: vec!["operator".to_string()],
+            retention_options: vec![RetentionPolicy::OneShot],
         };
         let mut prompts = SequencedPrompt::new(vec![
             PromptResponse::Submitted("correct horse".to_string()),
@@ -1565,6 +1776,7 @@ mod tests {
             cookie: "cookie-timeout".to_string(),
             username: "operator".to_string(),
             identity_options: vec!["operator".to_string()],
+            retention_options: vec![RetentionPolicy::OneShot],
         };
         let mut prompts = SequencedPrompt::new(vec![PromptResponse::TimedOut]);
 
@@ -1602,6 +1814,7 @@ mod tests {
             cookie: "cookie-ctx".to_string(),
             username: "operator".to_string(),
             identity_options: vec!["operator".to_string()],
+            retention_options: vec![RetentionPolicy::OneShot, RetentionPolicy::Session],
         };
 
         let context = render_prompt_context(&request);
@@ -1610,6 +1823,7 @@ mod tests {
         assert!(context.contains("Icon: preferences-system"));
         assert!(context.contains("Vendor: Gardesk"));
         assert!(context.contains("Application: Meson"));
+        assert!(context.contains("Retention options: one-shot, keep-session"));
         assert!(context.contains("Program: /usr/bin/meson"));
         assert!(context.contains("Executable: /usr/bin/pkexec"));
         assert!(context.contains("Command: meson install"));
@@ -1635,6 +1849,74 @@ mod tests {
     }
 
     #[test]
+    fn retention_options_from_details_supports_session_and_always() {
+        let mut session_details = HashMap::new();
+        session_details.insert(
+            "polkit.retains_authorization_after_challenge".to_string(),
+            "1".to_string(),
+        );
+        assert_eq!(
+            retention_options_from_details(&session_details),
+            vec![RetentionPolicy::OneShot, RetentionPolicy::Session]
+        );
+
+        let mut always_details = HashMap::new();
+        always_details.insert("polkit.retention".to_string(), "always".to_string());
+        assert_eq!(
+            retention_options_from_details(&always_details),
+            vec![
+                RetentionPolicy::OneShot,
+                RetentionPolicy::Session,
+                RetentionPolicy::Always
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_retention_selection_accepts_index_and_label() {
+        let options = vec![
+            RetentionPolicy::OneShot,
+            RetentionPolicy::Session,
+            RetentionPolicy::Always,
+        ];
+        assert_eq!(
+            parse_retention_selection("", &options),
+            Some(RetentionPolicy::OneShot)
+        );
+        assert_eq!(
+            parse_retention_selection("2", &options),
+            Some(RetentionPolicy::Session)
+        );
+        assert_eq!(
+            parse_retention_selection("keep always", &options),
+            Some(RetentionPolicy::Always)
+        );
+        assert_eq!(parse_retention_selection("unknown", &options), None);
+    }
+
+    #[test]
+    fn select_retention_for_request_uses_prompted_choice() {
+        let request = ActiveRequest {
+            action_id: "org.gardesk.test".to_string(),
+            message: "Authenticate".to_string(),
+            icon_name: "dialog-password".to_string(),
+            detail_count: 0,
+            details: HashMap::new(),
+            cookie: "cookie-retention".to_string(),
+            username: "operator".to_string(),
+            identity_options: vec!["operator".to_string()],
+            retention_options: vec![RetentionPolicy::OneShot, RetentionPolicy::Session],
+        };
+        let mut prompts = SequencedPrompt::new(vec![PromptResponse::Submitted("2".to_string())]);
+
+        let selection = select_retention_for_request(&request, &mut prompts);
+        assert!(matches!(
+            selection,
+            RetentionSelection::Selected(RetentionPolicy::Session)
+        ));
+    }
+
+    #[test]
     fn select_identity_for_request_uses_prompted_choice() {
         let request = ActiveRequest {
             action_id: "org.gardesk.test".to_string(),
@@ -1645,6 +1927,7 @@ mod tests {
             cookie: "cookie-identity".to_string(),
             username: "operator".to_string(),
             identity_options: vec!["operator".to_string(), "root".to_string()],
+            retention_options: vec![RetentionPolicy::OneShot],
         };
         let mut prompts = SequencedPrompt::new(vec![PromptResponse::Submitted("2".to_string())]);
 
@@ -1667,6 +1950,7 @@ mod tests {
             cookie: "cookie-identity-cancel".to_string(),
             username: "operator".to_string(),
             identity_options: vec!["operator".to_string(), "root".to_string()],
+            retention_options: vec![RetentionPolicy::OneShot],
         };
         let mut prompts = SequencedPrompt::new(vec![PromptResponse::Canceled]);
 
