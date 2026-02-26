@@ -1182,6 +1182,107 @@ mod tests {
     }
 
     #[test]
+    fn helper_client_handles_visible_prompt_round_trip() {
+        let socket_path = temp_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let read_stream = stream.try_clone().expect("clone");
+            let mut reader = BufReader::new(read_stream);
+
+            let mut first_line = String::new();
+            reader.read_line(&mut first_line).expect("read first line");
+            let first = first_line.trim().to_string();
+            if first == "operator" {
+                let mut cookie = String::new();
+                reader.read_line(&mut cookie).expect("read cookie");
+            }
+
+            stream
+                .write_all(b"PAM_TEXT_INFO Enter one-time code\n")
+                .expect("write info");
+            stream
+                .write_all(b"PAM_PROMPT_ECHO_ON Code:\n")
+                .expect("write prompt");
+            stream.flush().expect("flush prompt");
+
+            let mut code = String::new();
+            reader.read_line(&mut code).expect("read code");
+            assert_eq!(code.trim(), "123456");
+
+            stream.write_all(b"SUCCESS\n").expect("write success");
+            stream.flush().expect("flush success");
+        });
+
+        let client = HelperSocketClient::new(&socket_path);
+        let mut prompts = FakePrompt {
+            plain_response: PromptResponse::Submitted("123456".to_string()),
+            ..FakePrompt::default()
+        };
+
+        let outcome = client
+            .authenticate("operator", "cookie-visible", &mut prompts)
+            .expect("authenticate visible");
+        assert_eq!(outcome, HelperOutcome::Authorized);
+        assert_eq!(prompts.infos, vec!["Enter one-time code"]);
+        assert_eq!(prompts.success_count, 1);
+
+        server.join().expect("server join");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn helper_client_recovers_after_inline_error_message() {
+        let socket_path = temp_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let read_stream = stream.try_clone().expect("clone");
+            let mut reader = BufReader::new(read_stream);
+
+            let mut first_line = String::new();
+            reader.read_line(&mut first_line).expect("read first line");
+            if first_line.trim() == "operator" {
+                let mut cookie = String::new();
+                reader.read_line(&mut cookie).expect("read cookie");
+            }
+
+            stream
+                .write_all(b"PAM_ERROR_MSG Incorrect code, try again\n")
+                .expect("write error");
+            stream
+                .write_all(b"PAM_PROMPT_ECHO_OFF Password:\n")
+                .expect("write prompt");
+            stream.flush().expect("flush prompt");
+
+            let mut secret = String::new();
+            reader.read_line(&mut secret).expect("read secret");
+            assert_eq!(secret.trim(), "correct horse");
+
+            stream.write_all(b"SUCCESS\n").expect("write success");
+            stream.flush().expect("flush success");
+        });
+
+        let client = HelperSocketClient::new(&socket_path);
+        let mut prompts = FakePrompt {
+            secret_response: PromptResponse::Submitted("correct horse".to_string()),
+            ..FakePrompt::default()
+        };
+
+        let outcome = client
+            .authenticate("operator", "cookie-inline-error", &mut prompts)
+            .expect("authenticate recovery");
+        assert_eq!(outcome, HelperOutcome::Authorized);
+        assert_eq!(prompts.errors, vec!["Incorrect code, try again"]);
+        assert_eq!(prompts.success_count, 1);
+
+        server.join().expect("server join");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[test]
     fn helper_client_reports_timeout_from_prompt_provider() {
         let socket_path = temp_socket_path();
         let listener = UnixListener::bind(&socket_path).expect("bind test socket");
