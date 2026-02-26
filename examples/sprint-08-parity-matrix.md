@@ -13,8 +13,8 @@ Use this matrix to certify behavior against mature desktop PolicyKit agents.
 | Failure path | Trigger same `pkcheck` and enter wrong password | Prompt flashes error, reprompts in place, `auth-summary.last_outcome=failure` before retry | PASS (targeted) | 2026-02-26 deterministic wrong-password capture (`last_outcome: failure`, `pkcheck rc=1`) |
 | Cancel path | Trigger `pkcheck`, cancel prompt | Request exits cleanly, `auth-summary.last_outcome=canceled` | PASS (interactive) | `target/sprint-08-parity-evidence.md` (`cycle 3`, `last_outcome: canceled`) |
 | Timeout path | Set short timeout (`GARCARD_PROMPT_TIMEOUT_SECS=2`), trigger auth, do not respond | Request times out, `auth-summary.last_outcome=timeout` | PASS (targeted) | 2026-02-26 deterministic timeout capture (`last_outcome: timeout`, `pkcheck rc=1`) |
-| Multi-identity flow | Trigger policy requiring identity choice | Identity list rendered, selected identity is honored | BLOCKED (host policy) | Runtime callbacks report `identity_count=1` for tested action; no alternate admin identity surfaced |
-| Retention choice flow | Trigger policy exposing retention options | Retention choice accepted and recorded in `auth-summary` | BLOCKED (host policy) | Runtime details expose only `Retention options: one-shot` for tested action |
+| Multi-identity flow | Trigger policy requiring identity choice | Identity list rendered, selected identity is honored | PASS (targeted) | 2026-02-26 targeted capture prompt listed `mfwolffe` + `garcardqa`; helper connected as selected `garcardqa` |
+| Retention choice flow | Trigger policy exposing retention options | Retention choice accepted and recorded in `auth-summary` | PASS (targeted) | 2026-02-26 targeted capture showed retention prompt (`One-shot`, `Keep for session`); `auth-summary.last_retention_policy=keep-session` |
 | Temp auth introspection | Run `garcardctl temp-list` after successful retained auth | Active temporary authorization entries are listed | PASS (interactive) | `target/sprint-08-parity-evidence.md` (`tmpauthz0/tmpauthz1` listed) |
 | Temp auth revoke single | Run `garcardctl temp-revoke <id>` | Target authorization removed | PASS (targeted) | 2026-02-26 single-id revoke (`tmpauthz0` present before, revoked true, absent after) |
 | Temp auth revoke all | Run `garcardctl temp-revoke-all` | All temporary authorizations removed | PASS (interactive) | `target/sprint-08-parity-evidence.md` (`revoked_count: 1` after cycle 1/2) |
@@ -24,7 +24,6 @@ Use this matrix to certify behavior against mature desktop PolicyKit agents.
 ## Signoff
 1. Date: 2026-02-26 (baseline run)
 2. Operator: mfwolffe/codex
-3. Result (`PASS`/`FAIL`): IN PROGRESS
+3. Result (`PASS`/`FAIL`): PASS
 4. Blocking gaps:
-   - multi-identity scenario requires host with >1 eligible identity for same action
-   - retention-choice scenario requires host policy/details exposing session/always options
+   - none

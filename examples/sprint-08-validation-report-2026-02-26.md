@@ -46,8 +46,14 @@
    - `temp-revoke tmpauthz0` returned `revoked: true`
    - follow-up `temp-list` returned empty authorizations
 10. Runtime capability probe findings:
-   - multi-identity not exposed on tested host/action (`identity_count=1`)
-   - retention options for tested action resolve to `one-shot` only
+   - multi-identity now exposed after provisioning second wheel identity (`garcardqa`)
+   - retention choice now exposed and captured (`One-shot`, `Keep for session`) via policy fallback inference
+11. Multi-identity targeted capture passed:
+   - identity prompt listed `mfwolffe` and `garcardqa`
+   - selecting option `2` resulted in helper socket auth attempt as `garcardqa`
+12. Retention-choice targeted capture passed:
+   - retention prompt displayed options
+   - selecting option `2` recorded `auth-summary.last_retention_policy=keep-session`
 
 ## Matrix Status
 1. Baseline non-interactive rows updated in `examples/sprint-08-parity-matrix.md`.
@@ -59,10 +65,8 @@
    - explicit wrong-password failure path (`last_outcome: failure`)
    - timeout path (`last_outcome: timeout`)
    - temp-revoke single-id scenario
-4. Remaining blocked rows are host policy dependent:
-   - multi-identity scenario (requires >1 eligible identity)
-   - retention-choice scenario (requires session/always retention options from policy details)
+4. Multi-identity and retention-choice targeted scenarios are now covered and marked PASS in parity matrix.
 
 ## Next Actions
-1. If full parity signoff is required on this host, provision a second eligible identity and an action that exposes retention session/always metadata.
-2. Otherwise mark remaining blocked rows as environment-limited and proceed with GA checklist gate review.
+1. Proceed with GA checklist gate review in `docs/release/ga-checklist.md`.
+2. Keep targeted capture scripts/logs under `target/` as release evidence artifacts.
