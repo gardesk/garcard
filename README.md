@@ -75,6 +75,11 @@ gartk prompt path with a persistent in-process modal session and falls back to
    - run with debug logs: `RUST_LOG=garcard=debug cargo run -p garcard -- daemon`
    - verify fallback path by setting `GARCARD_PROMPT_COMMAND` explicitly
 
+## Runbooks
+1. `docs/runbooks/migrate-from-external-agent.md`
+2. `docs/runbooks/incident-triage.md`
+3. `docs/runbooks/garcardctl-cookbook.md`
+
 ## Known Limitations
 1. Policy results are host-specific; some actions may auto-authorize and not trigger prompts.
 2. Current implementation targets logged-in user sessions on X11.
