@@ -287,7 +287,15 @@ fn dispatch(
 ) -> Response {
     match command {
         Command::Ping => Response::ok_with_data(json!({ "pong": true })),
-        Command::Status => Response::ok_with_data(state.status()),
+        Command::Status => {
+            let mut status = state.status();
+            let diagnostics = collect_authority_diagnostics();
+            status.authority_connected = Some(diagnostics.authority_connected);
+            status.authority_error = diagnostics.authority_error.clone();
+            status.subject_kind = Some(diagnostics.subject.kind.clone());
+            status.temporary_authorization_count = diagnostics.temporary_authorization_count;
+            Response::ok_with_data(status)
+        }
         Command::Diagnose => {
             let diagnostics = collect_authority_diagnostics();
             let auth_summary = state.auth_summary();
@@ -413,6 +421,19 @@ mod tests {
 
         let data = response.data.expect("data");
         assert_eq!(data.get("pong").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn dispatch_status_includes_health_surface_fields() {
+        let state = fake_state();
+        let (shutdown_tx, _shutdown_rx) = mpsc::unbounded_channel();
+
+        let response = dispatch(Command::Status, &state, &shutdown_tx);
+        assert!(response.success);
+
+        let data = response.data.expect("data");
+        assert!(data.get("authority_connected").is_some());
+        assert!(data.get("subject_kind").is_some());
     }
 
     #[test]

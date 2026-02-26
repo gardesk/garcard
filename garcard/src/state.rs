@@ -330,6 +330,10 @@ impl RuntimeState {
             protocol_version: PROTOCOL_VERSION,
             socket_path: self.socket_path.clone(),
             agent_backend: self.backend_name.to_string(),
+            authority_connected: None,
+            authority_error: None,
+            subject_kind: None,
+            temporary_authorization_count: None,
         }
     }
 
@@ -379,6 +383,16 @@ mod tests {
         assert_eq!(summary.state, "verifying");
         assert_eq!(summary.active_requests, 2);
         assert_eq!(summary.queued_requests, 3);
+    }
+
+    #[test]
+    fn runtime_status_initializes_optional_health_fields() {
+        let runtime = RuntimeState::new("/tmp/garcard-test.sock".to_string(), "test-backend");
+        let status = runtime.status();
+        assert!(status.authority_connected.is_none());
+        assert!(status.authority_error.is_none());
+        assert!(status.subject_kind.is_none());
+        assert!(status.temporary_authorization_count.is_none());
     }
 
     #[test]

@@ -74,6 +74,14 @@ pub struct StatusData {
     pub protocol_version: u32,
     pub socket_path: String,
     pub agent_backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority_connected: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temporary_authorization_count: Option<usize>,
 }
 
 /// Version handshake payload.
