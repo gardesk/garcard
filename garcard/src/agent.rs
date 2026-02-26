@@ -552,11 +552,39 @@ fn render_prompt_context(request: &ActiveRequest) -> String {
         lines.push(format!("Icon: {}", request.icon_name.trim()));
     }
 
+    if let Some(vendor) = first_detail_value(
+        &request.details,
+        &[
+            "vendor",
+            "vendor_name",
+            "polkit.vendor",
+            "polkit.vendor_name",
+        ],
+    ) {
+        lines.push(format!("Vendor: {}", vendor));
+    }
+
+    if let Some(application) = first_detail_value(
+        &request.details,
+        &[
+            "application",
+            "application_name",
+            "program_name",
+            "polkit.program_name",
+        ],
+    ) {
+        lines.push(format!("Application: {}", application));
+    }
+
     let detail_keys = [
         "program",
+        "polkit.exec.path",
+        "polkit.exec.argv1",
         "command_line",
         "unit",
         "verb",
+        "polkit.message",
+        "polkit.gettext_domain",
         "polkit.retains_authorization_after_challenge",
     ];
     for key in detail_keys {
@@ -688,12 +716,30 @@ fn identity_options_from_subjects(identities: &[Subject]) -> Vec<String> {
     options
 }
 
+fn first_detail_value(details: &Details, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        let Some(value) = details.get(*key) else {
+            continue;
+        };
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
 fn detail_key_label(key: &str) -> &'static str {
     match key {
         "program" => "Program",
+        "polkit.exec.path" => "Executable",
+        "polkit.exec.argv1" => "Executable Arg",
         "command_line" => "Command",
         "unit" => "Unit",
         "verb" => "Verb",
+        "polkit.message" => "Policy Message",
+        "polkit.gettext_domain" => "Text Domain",
         "polkit.retains_authorization_after_challenge" => "Retains authorization",
         _ => "Detail",
     }
@@ -1419,7 +1465,7 @@ mod tests {
                 let mut first_line = String::new();
                 reader.read_line(&mut first_line).expect("read first line");
                 let first = first_line.trim().to_string();
-                if first == "alice" {
+                if first == "operator" {
                     let mut cookie = String::new();
                     reader.read_line(&mut cookie).expect("read cookie");
                 }
@@ -1459,8 +1505,8 @@ mod tests {
             detail_count: 0,
             details: HashMap::new(),
             cookie: "cookie-1".to_string(),
-            username: "alice".to_string(),
-            identity_options: vec!["alice".to_string()],
+            username: "operator".to_string(),
+            identity_options: vec!["operator".to_string()],
         };
         let mut prompts = SequencedPrompt::new(vec![
             PromptResponse::Submitted("correct horse".to_string()),
@@ -1489,7 +1535,7 @@ mod tests {
 
             let mut first_line = String::new();
             reader.read_line(&mut first_line).expect("read first line");
-            if first_line.trim() == "alice" {
+            if first_line.trim() == "operator" {
                 let mut cookie = String::new();
                 reader.read_line(&mut cookie).expect("read cookie");
             }
@@ -1517,8 +1563,8 @@ mod tests {
             detail_count: 0,
             details: HashMap::new(),
             cookie: "cookie-timeout".to_string(),
-            username: "alice".to_string(),
-            identity_options: vec!["alice".to_string()],
+            username: "operator".to_string(),
+            identity_options: vec!["operator".to_string()],
         };
         let mut prompts = SequencedPrompt::new(vec![PromptResponse::TimedOut]);
 
@@ -1535,7 +1581,13 @@ mod tests {
     #[test]
     fn render_prompt_context_includes_policy_details() {
         let mut details = HashMap::new();
+        details.insert("vendor".to_string(), "Gardesk".to_string());
+        details.insert("application_name".to_string(), "Meson".to_string());
         details.insert("program".to_string(), "/usr/bin/meson".to_string());
+        details.insert(
+            "polkit.exec.path".to_string(),
+            "/usr/bin/pkexec".to_string(),
+        );
         details.insert("command_line".to_string(), "meson install".to_string());
         details.insert(
             "polkit.retains_authorization_after_challenge".to_string(),
@@ -1548,35 +1600,38 @@ mod tests {
             detail_count: details.len(),
             details,
             cookie: "cookie-ctx".to_string(),
-            username: "alice".to_string(),
-            identity_options: vec!["alice".to_string()],
+            username: "operator".to_string(),
+            identity_options: vec!["operator".to_string()],
         };
 
         let context = render_prompt_context(&request);
         assert!(context.contains("Authentication is required to install this project"));
         assert!(context.contains("Action: com.mesonbuild.install.run"));
         assert!(context.contains("Icon: preferences-system"));
+        assert!(context.contains("Vendor: Gardesk"));
+        assert!(context.contains("Application: Meson"));
         assert!(context.contains("Program: /usr/bin/meson"));
+        assert!(context.contains("Executable: /usr/bin/pkexec"));
         assert!(context.contains("Command: meson install"));
         assert!(context.contains("Retains authorization: 1"));
     }
 
     #[test]
     fn parse_identity_selection_accepts_blank_index_and_name() {
-        let options = vec!["alice".to_string(), "root".to_string()];
+        let options = vec!["operator".to_string(), "root".to_string()];
         assert_eq!(
-            parse_identity_selection("", &options, "alice"),
-            Some("alice".to_string())
+            parse_identity_selection("", &options, "operator"),
+            Some("operator".to_string())
         );
         assert_eq!(
-            parse_identity_selection("2", &options, "alice"),
+            parse_identity_selection("2", &options, "operator"),
             Some("root".to_string())
         );
         assert_eq!(
-            parse_identity_selection("ROOT", &options, "alice"),
+            parse_identity_selection("ROOT", &options, "operator"),
             Some("root".to_string())
         );
-        assert_eq!(parse_identity_selection("99", &options, "alice"), None);
+        assert_eq!(parse_identity_selection("99", &options, "operator"), None);
     }
 
     #[test]
@@ -1588,8 +1643,8 @@ mod tests {
             detail_count: 0,
             details: HashMap::new(),
             cookie: "cookie-identity".to_string(),
-            username: "alice".to_string(),
-            identity_options: vec!["alice".to_string(), "root".to_string()],
+            username: "operator".to_string(),
+            identity_options: vec!["operator".to_string(), "root".to_string()],
         };
         let mut prompts = SequencedPrompt::new(vec![PromptResponse::Submitted("2".to_string())]);
 
@@ -1610,8 +1665,8 @@ mod tests {
             detail_count: 0,
             details: HashMap::new(),
             cookie: "cookie-identity-cancel".to_string(),
-            username: "alice".to_string(),
-            identity_options: vec!["alice".to_string(), "root".to_string()],
+            username: "operator".to_string(),
+            identity_options: vec!["operator".to_string(), "root".to_string()],
         };
         let mut prompts = SequencedPrompt::new(vec![PromptResponse::Canceled]);
 
