@@ -12,6 +12,12 @@
 2. `cargo run -p garcardctl -- status`
 3. `cargo run -p garcard -- prompt --mode secret --message "Validation prompt"`
 
+## Lifecycle Commands
+1. `cargo run -q -p garcardctl -- diagnose`
+2. `cargo run -q -p garcardctl -- temp-list`
+3. `cargo run -q -p garcardctl -- temp-revoke <authorization-id>`
+4. `cargo run -q -p garcardctl -- temp-revoke-all`
+
 ## User Service
 1. Install unit file:
    - `install -Dm644 garcard.service ~/.config/systemd/user/garcard.service`
@@ -52,10 +58,13 @@ gartk prompt path with a persistent in-process modal session and falls back to
 5. `examples/validate-sprint-03-integration.sh`
 6. `examples/validate-sprint-04.sh`
 7. `examples/validate-sprint-04-runtime.sh`
+8. `examples/sprint-07-validation.md`
+9. `examples/validate-sprint-07.sh`
 
 ## Troubleshooting
 1. `Authorization requires authentication but no agent is available`
    - ensure daemon is running: `cargo run -q -p garcardctl -- ping`
+   - inspect authority and subject health: `cargo run -q -p garcardctl -- diagnose`
    - restart daemon after polkit restart: `cargo run -q -p garcardctl -- quit` then relaunch
 2. `failed to connect to garcard daemon ...`
    - check socket path from `garcardctl status`
