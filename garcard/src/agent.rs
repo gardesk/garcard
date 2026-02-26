@@ -66,6 +66,32 @@ pub struct TemporaryAuthorizationRecord {
     pub expires_at_unix: u64,
     pub expires_in_secs: u64,
 }
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubjectResolution {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_time_ticks: Option<u64>,
+    pub has_start_time: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuthorityDiagnostics {
+    pub authority_connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority_error: Option<String>,
+    pub subject: SubjectResolution,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temporary_authorization_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temporary_authorization_error: Option<String>,
+}
 const DEFAULT_AUTH_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_IDENTITY_SELECTION_ATTEMPTS: usize = 3;
 const DEFAULT_RETENTION_SELECTION_ATTEMPTS: usize = 3;
@@ -672,28 +698,7 @@ fn helper_outcome_label(outcome: HelperOutcome) -> &'static str {
 pub fn enumerate_temporary_authorizations() -> Result<Vec<TemporaryAuthorizationRecord>> {
     let connection = Connection::system().context("failed to connect to system bus")?;
     let subject = build_subject();
-    let proxy = PolkitAgent::proxy(&connection)?;
-    let authorizations: Vec<TemporaryAuthorization> =
-        proxy.call("EnumerateTemporaryAuthorizations", &subject)?;
-    let now_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-
-    let mut entries = Vec::with_capacity(authorizations.len());
-    for (authorization_id, action_id, _subject, obtained_at_unix, expires_at_unix) in authorizations
-    {
-        let expires_in_secs = expires_at_unix.saturating_sub(now_unix);
-        entries.push(TemporaryAuthorizationRecord {
-            authorization_id,
-            action_id,
-            obtained_at_unix,
-            expires_at_unix,
-            expires_in_secs,
-        });
-    }
-    entries.sort_by(|left, right| left.action_id.cmp(&right.action_id));
-    Ok(entries)
+    enumerate_temporary_authorizations_for_subject(&connection, &subject)
 }
 
 pub fn revoke_temporary_authorization_by_id(authorization_id: &str) -> Result<()> {
@@ -737,6 +742,101 @@ fn revoke_temporary_authorizations_for_action(action_id: &str) -> Result<usize> 
     }
 
     Ok(revoked)
+}
+
+pub fn current_subject_resolution() -> SubjectResolution {
+    if let Some(session_id) = current_session_id() {
+        return SubjectResolution {
+            kind: "unix-session".to_string(),
+            session_id: Some(session_id),
+            pid: None,
+            uid: None,
+            start_time_ticks: None,
+            has_start_time: false,
+        };
+    }
+
+    let start_time_ticks = process_start_time_ticks();
+    SubjectResolution {
+        kind: "unix-process".to_string(),
+        session_id: None,
+        pid: Some(std::process::id()),
+        uid: Some(nix::unistd::geteuid().as_raw()),
+        start_time_ticks,
+        has_start_time: start_time_ticks.is_some(),
+    }
+}
+
+pub fn collect_authority_diagnostics() -> AuthorityDiagnostics {
+    let subject = current_subject_resolution();
+    let connection = match Connection::system() {
+        Ok(connection) => connection,
+        Err(err) => {
+            return AuthorityDiagnostics {
+                authority_connected: false,
+                authority_error: Some(format!("failed to connect to system bus: {}", err)),
+                subject,
+                temporary_authorization_count: None,
+                temporary_authorization_error: None,
+            };
+        }
+    };
+
+    if let Err(err) = PolkitAgent::ping_authority(&connection) {
+        return AuthorityDiagnostics {
+            authority_connected: false,
+            authority_error: Some(format!("polkit authority ping failed: {}", err)),
+            subject,
+            temporary_authorization_count: None,
+            temporary_authorization_error: None,
+        };
+    }
+
+    let polkit_subject = subject_to_polkit_subject(&subject);
+    match enumerate_temporary_authorizations_for_subject(&connection, &polkit_subject) {
+        Ok(authorizations) => AuthorityDiagnostics {
+            authority_connected: true,
+            authority_error: None,
+            subject,
+            temporary_authorization_count: Some(authorizations.len()),
+            temporary_authorization_error: None,
+        },
+        Err(err) => AuthorityDiagnostics {
+            authority_connected: true,
+            authority_error: None,
+            subject,
+            temporary_authorization_count: None,
+            temporary_authorization_error: Some(err.to_string()),
+        },
+    }
+}
+
+fn enumerate_temporary_authorizations_for_subject(
+    connection: &Connection,
+    subject: &Subject,
+) -> Result<Vec<TemporaryAuthorizationRecord>> {
+    let proxy = PolkitAgent::proxy(connection)?;
+    let authorizations: Vec<TemporaryAuthorization> =
+        proxy.call("EnumerateTemporaryAuthorizations", subject)?;
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+
+    let mut entries = Vec::with_capacity(authorizations.len());
+    for (authorization_id, action_id, _subject, obtained_at_unix, expires_at_unix) in authorizations
+    {
+        let expires_in_secs = expires_at_unix.saturating_sub(now_unix);
+        entries.push(TemporaryAuthorizationRecord {
+            authorization_id,
+            action_id,
+            obtained_at_unix,
+            expires_at_unix,
+            expires_in_secs,
+        });
+    }
+    entries.sort_by(|left, right| left.action_id.cmp(&right.action_id));
+    Ok(entries)
 }
 
 fn render_prompt_context(request: &ActiveRequest) -> String {
@@ -1506,6 +1606,14 @@ fn build_subject() -> Subject {
     subject_from_session_id(current_session_id())
 }
 
+fn subject_to_polkit_subject(subject: &SubjectResolution) -> Subject {
+    if subject.kind == "unix-session" {
+        return subject_from_session_id(subject.session_id.clone());
+    }
+
+    build_unix_process_subject()
+}
+
 fn subject_from_session_id(session_id: Option<String>) -> Subject {
     if let Some(session_id) = session_id {
         let mut details = HashMap::new();
@@ -1691,6 +1799,43 @@ mod tests {
         assert!(subject.1.contains_key("pid"));
         assert!(subject.1.contains_key("uid"));
         assert!(subject.1.contains_key("start-time"));
+    }
+
+    #[test]
+    fn subject_to_polkit_subject_uses_session_resolution() {
+        let resolution = SubjectResolution {
+            kind: "unix-session".to_string(),
+            session_id: Some("42".to_string()),
+            pid: None,
+            uid: None,
+            start_time_ticks: None,
+            has_start_time: false,
+        };
+
+        let subject = subject_to_polkit_subject(&resolution);
+        assert_eq!(subject.0.as_str(), "unix-session");
+        let session_id = subject
+            .1
+            .get("session-id")
+            .and_then(|value| <&str>::try_from(value).ok());
+        assert_eq!(session_id, Some("42"));
+    }
+
+    #[test]
+    fn subject_to_polkit_subject_falls_back_to_unix_process_resolution() {
+        let resolution = SubjectResolution {
+            kind: "unix-process".to_string(),
+            session_id: None,
+            pid: Some(std::process::id()),
+            uid: Some(nix::unistd::geteuid().as_raw()),
+            start_time_ticks: process_start_time_ticks(),
+            has_start_time: true,
+        };
+
+        let subject = subject_to_polkit_subject(&resolution);
+        assert_eq!(subject.0.as_str(), "unix-process");
+        assert!(subject.1.contains_key("pid"));
+        assert!(subject.1.contains_key("uid"));
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub const SOCKET_BASENAME: &str = "garcard.sock";
 pub enum Command {
     Ping,
     Status,
+    Diagnose,
     Version,
     AuthSummary,
     TempList,
@@ -159,6 +160,14 @@ mod tests {
         let encoded = serde_json::to_string(&cmd).expect("encode command");
         let decoded: Command = serde_json::from_str(&encoded).expect("decode command");
         assert!(matches!(decoded, Command::AuthSummary));
+    }
+
+    #[test]
+    fn command_round_trip_diagnose() {
+        let cmd = Command::Diagnose;
+        let encoded = serde_json::to_string(&cmd).expect("encode command");
+        let decoded: Command = serde_json::from_str(&encoded).expect("decode command");
+        assert!(matches!(decoded, Command::Diagnose));
     }
 
     #[test]

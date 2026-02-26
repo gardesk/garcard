@@ -15,6 +15,7 @@ struct Cli {
 enum Commands {
     Ping,
     Status,
+    Diagnose,
     Version,
     AuthSummary,
     TempList,
@@ -48,6 +49,7 @@ fn to_protocol_command(command: Commands) -> Command {
     match command {
         Commands::Ping => Command::Ping,
         Commands::Status => Command::Status,
+        Commands::Diagnose => Command::Diagnose,
         Commands::Version => Command::Version,
         Commands::AuthSummary => Command::AuthSummary,
         Commands::TempList => Command::TempList,

@@ -1,7 +1,7 @@
 use crate::agent::{
     AuthAgentBackend, PolkitAgent, PolkitBackendConfig, StubPolkitAgent,
-    enumerate_temporary_authorizations, revoke_all_temporary_authorizations,
-    revoke_temporary_authorization_by_id,
+    collect_authority_diagnostics, enumerate_temporary_authorizations,
+    revoke_all_temporary_authorizations, revoke_temporary_authorization_by_id,
 };
 use crate::config::{AgentBackendMode, Config};
 use crate::state::{AuthState, RuntimeState};
@@ -288,6 +288,20 @@ fn dispatch(
     match command {
         Command::Ping => Response::ok_with_data(json!({ "pong": true })),
         Command::Status => Response::ok_with_data(state.status()),
+        Command::Diagnose => {
+            let diagnostics = collect_authority_diagnostics();
+            let auth_summary = state.auth_summary();
+            let hints = diagnostics_hints(&diagnostics, auth_summary.last_outcome.as_deref());
+            Response::ok_with_data(json!({
+                "authority_connected": diagnostics.authority_connected,
+                "authority_error": diagnostics.authority_error,
+                "subject": diagnostics.subject,
+                "temporary_authorization_count": diagnostics.temporary_authorization_count,
+                "temporary_authorization_error": diagnostics.temporary_authorization_error,
+                "last_outcome": auth_summary.last_outcome,
+                "hints": hints,
+            }))
+        }
         Command::Version => Response::ok_with_data(state.version()),
         Command::AuthSummary => Response::ok_with_data(state.auth_summary()),
         Command::TempList => match enumerate_temporary_authorizations() {
@@ -328,6 +342,56 @@ fn dispatch(
     }
 }
 
+fn diagnostics_hints(
+    diagnostics: &crate::agent::AuthorityDiagnostics,
+    last_outcome: Option<&str>,
+) -> Vec<String> {
+    let mut hints = Vec::new();
+
+    if !diagnostics.authority_connected {
+        hints.push(
+            "No agent path: verify garcard daemon is running and reachable with `garcardctl ping`."
+                .to_string(),
+        );
+        hints.push(
+            "If polkit was restarted, relaunch garcard (`garcardctl quit`, then start daemon again)."
+                .to_string(),
+        );
+    }
+
+    if diagnostics.subject.kind != "unix-session" {
+        hints.push(
+            "Subject is `unix-process` fallback; set a valid `XDG_SESSION_ID` and restart daemon for session-scoped auth."
+                .to_string(),
+        );
+    }
+
+    if diagnostics
+        .temporary_authorization_error
+        .as_ref()
+        .is_some_and(|error| !error.trim().is_empty())
+    {
+        hints.push(
+            "Temporary-authorization inspection failed; verify authority permissions and dbus connectivity."
+                .to_string(),
+        );
+    }
+
+    if matches!(last_outcome, Some("failure")) {
+        hints.push(
+            "Denied flow observed; verify account policy membership (admin/wheel) and retry with `pkcheck --allow-user-interaction ...`."
+                .to_string(),
+        );
+    } else {
+        hints.push(
+            "For denied-flow debugging, run daemon with `RUST_LOG=garcard=debug` and trigger via `pkcheck --allow-user-interaction ...`."
+                .to_string(),
+        );
+    }
+
+    hints
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +423,59 @@ mod tests {
         let response = dispatch(Command::Quit, &state, &shutdown_tx);
         assert!(response.success);
         assert!(shutdown_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn diagnostics_hints_cover_no_agent_and_denied_flows() {
+        let diagnostics = crate::agent::AuthorityDiagnostics {
+            authority_connected: false,
+            authority_error: Some("failed to connect to system bus".to_string()),
+            subject: crate::agent::SubjectResolution {
+                kind: "unix-process".to_string(),
+                session_id: None,
+                pid: Some(1000),
+                uid: Some(1000),
+                start_time_ticks: None,
+                has_start_time: false,
+            },
+            temporary_authorization_count: None,
+            temporary_authorization_error: Some("dbus unavailable".to_string()),
+        };
+
+        let hints = diagnostics_hints(&diagnostics, Some("failure"));
+        assert!(hints.iter().any(|hint| hint.contains("No agent path")));
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.contains("Denied flow observed"))
+        );
+        assert!(hints.iter().any(|hint| hint.contains("unix-process")));
+    }
+
+    #[test]
+    fn diagnostics_hints_include_debug_guidance_without_failure_outcome() {
+        let diagnostics = crate::agent::AuthorityDiagnostics {
+            authority_connected: true,
+            authority_error: None,
+            subject: crate::agent::SubjectResolution {
+                kind: "unix-session".to_string(),
+                session_id: Some("7".to_string()),
+                pid: None,
+                uid: None,
+                start_time_ticks: None,
+                has_start_time: false,
+            },
+            temporary_authorization_count: Some(1),
+            temporary_authorization_error: None,
+        };
+
+        let hints = diagnostics_hints(&diagnostics, Some("success"));
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.contains("denied-flow debugging"))
+        );
+        assert!(!hints.iter().any(|hint| hint.contains("No agent path")));
     }
 
     #[test]
