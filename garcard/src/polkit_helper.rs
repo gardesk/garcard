@@ -4,6 +4,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const DEFAULT_HELPER_SOCKET: &str = "/run/polkit/agent-helper.socket";
@@ -60,12 +61,14 @@ pub trait PromptProvider {
 #[derive(Debug, Clone)]
 pub struct HelperSocketClient {
     socket_path: PathBuf,
+    pinned_protocol: Arc<Mutex<Option<HelperSocketProtocol>>>,
 }
 
 impl Default for HelperSocketClient {
     fn default() -> Self {
         Self {
             socket_path: PathBuf::from(DEFAULT_HELPER_SOCKET),
+            pinned_protocol: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -74,6 +77,7 @@ impl HelperSocketClient {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: path.into(),
+            pinned_protocol: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -131,18 +135,33 @@ impl HelperSocketClient {
         cookie: &str,
         prompts: &mut P,
     ) -> Result<HelperOutcome> {
-        let protocols = [
+        let mut protocols = Vec::new();
+        let pinned = self.pinned_socket_protocol();
+        if let Some(protocol) = pinned {
+            protocols.push(protocol);
+        }
+        for protocol in [
             HelperSocketProtocol::CookieOnly,
             HelperSocketProtocol::UsernameCookie,
-        ];
+        ] {
+            if Some(protocol) != pinned {
+                protocols.push(protocol);
+            }
+        }
 
         for protocol in protocols {
             match self.authenticate_via_socket(username, cookie, prompts, protocol) {
-                Ok(outcome) => return Ok(outcome),
+                Ok(outcome) => {
+                    self.pin_socket_protocol(protocol);
+                    return Ok(outcome);
+                }
                 Err(err)
                     if is_no_session_cookie_error(&err)
                         || is_no_initial_helper_response_error(&err) =>
                 {
+                    if self.pinned_socket_protocol() == Some(protocol) {
+                        self.clear_pinned_socket_protocol();
+                    }
                     tracing::warn!(
                         protocol = %protocol.as_str(),
                         error = %err,
@@ -157,6 +176,22 @@ impl HelperSocketClient {
             .auth_failed("Authentication failed")
             .context("prompt failure callback failed")?;
         Ok(HelperOutcome::Denied)
+    }
+
+    fn pinned_socket_protocol(&self) -> Option<HelperSocketProtocol> {
+        self.pinned_protocol.lock().ok().and_then(|guard| *guard)
+    }
+
+    fn pin_socket_protocol(&self, protocol: HelperSocketProtocol) {
+        if let Ok(mut pinned) = self.pinned_protocol.lock() {
+            *pinned = Some(protocol);
+        }
+    }
+
+    fn clear_pinned_socket_protocol(&self) {
+        if let Ok(mut pinned) = self.pinned_protocol.lock() {
+            *pinned = None;
+        }
     }
 
     fn authenticate_via_socket<P: PromptProvider>(
@@ -981,6 +1016,81 @@ mod tests {
         assert_eq!(prompts.errors, vec!["previous attempt failed"]);
 
         server.join().expect("server join");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn helper_client_pins_working_socket_protocol_after_fallback() {
+        let socket_path = temp_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+        let observed_first_lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed_for_thread = Arc::clone(&observed_first_lines);
+
+        let server = thread::spawn(move || {
+            for phase in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let read_stream = stream.try_clone().expect("clone");
+                let mut reader = BufReader::new(read_stream);
+
+                let mut first_line = String::new();
+                reader.read_line(&mut first_line).expect("read first line");
+                let first = first_line.trim().to_string();
+                observed_for_thread
+                    .lock()
+                    .expect("lock observed")
+                    .push(first.clone());
+
+                match phase {
+                    0 => {
+                        assert_ne!(first, "alice");
+                        stream
+                            .write_all(b"polkit-agent-helper-1: error response to PolicyKit daemon: GDBus.Error:org.freedesktop.PolicyKit1.Error.Failed: No session for cookie\n")
+                            .expect("write no-session error");
+                        stream.write_all(b"FAILURE\n").expect("write failure");
+                        stream.flush().expect("flush failure");
+                    }
+                    1 | 2 => {
+                        assert_eq!(first, "alice");
+                        let mut cookie = String::new();
+                        reader.read_line(&mut cookie).expect("read cookie");
+
+                        stream
+                            .write_all(b"PAM_PROMPT_ECHO_OFF Password:\n")
+                            .expect("write prompt");
+                        stream.flush().expect("flush prompt");
+
+                        let mut secret = String::new();
+                        reader.read_line(&mut secret).expect("read secret");
+                        stream.write_all(b"SUCCESS\n").expect("write success");
+                        stream.flush().expect("flush success");
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        });
+
+        let client = HelperSocketClient::new(&socket_path);
+        let mut prompts = FakePrompt {
+            secret_response: PromptResponse::Submitted("correct horse".to_string()),
+            ..FakePrompt::default()
+        };
+
+        let first = client
+            .authenticate("alice", "cookie-one", &mut prompts)
+            .expect("first authenticate");
+        assert_eq!(first, HelperOutcome::Authorized);
+        let second = client
+            .authenticate("alice", "cookie-two", &mut prompts)
+            .expect("second authenticate");
+        assert_eq!(second, HelperOutcome::Authorized);
+
+        server.join().expect("server join");
+        let lines = observed_first_lines.lock().expect("lock observed");
+        assert_eq!(lines.len(), 3);
+        assert_ne!(lines[0], "alice");
+        assert_eq!(lines[1], "alice");
+        assert_eq!(lines[2], "alice");
+
         let _ = std::fs::remove_file(&socket_path);
     }
 
