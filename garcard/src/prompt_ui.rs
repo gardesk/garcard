@@ -9,11 +9,149 @@ use std::time::{Duration, Instant};
 use x11rb::connection::Connection as X11Connection;
 use x11rb::protocol::xproto::ConnectionExt;
 
-const DIALOG_WIDTH: u32 = 560;
-const DIALOG_HEIGHT: u32 = 240;
-const CARD_PADDING: i32 = 18;
+const BASE_DIALOG_WIDTH: u32 = 560;
+const BASE_DIALOG_HEIGHT: u32 = 240;
+const BASE_CARD_PADDING: i32 = 18;
 const ERROR_BLINK_INTERVAL: Duration = Duration::from_millis(180);
 const RETRY_ERROR_FLASH_DURATION: Duration = Duration::from_millis(900);
+const DEFAULT_UI_SCALE: f32 = 1.0;
+const MIN_UI_SCALE: f32 = 0.8;
+const MAX_UI_SCALE: f32 = 2.0;
+
+#[derive(Debug, Clone, Copy)]
+struct PromptStrings {
+    title_auth_required: &'static str,
+    label_password: &'static str,
+    label_response: &'static str,
+    footer_wait: &'static str,
+    footer_controls: &'static str,
+    timeout_label: &'static str,
+}
+
+impl PromptStrings {
+    fn for_locale(locale: &str) -> Self {
+        match locale_bucket(locale) {
+            "es" => Self {
+                title_auth_required: "Autenticacion requerida",
+                label_password: "Contrasena",
+                label_response: "Respuesta",
+                footer_wait: "Espere",
+                footer_controls: "Enter enviar   Esc cancelar",
+                timeout_label: "tiempo",
+            },
+            _ => Self {
+                title_auth_required: "Authentication Required",
+                label_password: "Password",
+                label_response: "Response",
+                footer_wait: "Please wait",
+                footer_controls: "Enter submit   Esc cancel",
+                timeout_label: "timeout",
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PromptPalette {
+    backdrop: Color,
+    card_background: Color,
+    card_border: Color,
+    accent: Color,
+    success: Color,
+    error: Color,
+    focus_ring: Color,
+}
+
+impl PromptPalette {
+    fn from_high_contrast(high_contrast: bool) -> Result<Self> {
+        if high_contrast {
+            return Ok(Self {
+                backdrop: Color::from_hex("#000000")
+                    .context("invalid high-contrast prompt backdrop color")?,
+                card_background: Color::from_hex("#050505")
+                    .context("invalid high-contrast prompt card background color")?,
+                card_border: Color::from_hex("#f2f2f2")
+                    .context("invalid high-contrast prompt card border color")?,
+                accent: Color::from_hex("#30d5ff")
+                    .context("invalid high-contrast prompt accent color")?,
+                success: Color::from_hex("#54f07a")
+                    .context("invalid high-contrast prompt success color")?,
+                error: Color::from_hex("#ff5f6d")
+                    .context("invalid high-contrast prompt error color")?,
+                focus_ring: Color::from_hex("#ffffff")
+                    .context("invalid high-contrast prompt focus ring color")?,
+            });
+        }
+
+        Ok(Self {
+            backdrop: Color::from_hex("#0a0b10").context("invalid prompt backdrop color")?,
+            card_background: Color::from_hex("#111318")
+                .context("invalid prompt card background color")?,
+            card_border: Color::from_hex("#2c3442").context("invalid prompt card border color")?,
+            accent: Color::from_hex("#8ab4f8").context("invalid prompt accent color")?,
+            success: Color::from_hex("#41c87a").context("invalid prompt success color")?,
+            error: Color::from_hex("#ff5f6d").context("invalid prompt error color")?,
+            focus_ring: Color::from_hex("#d5e3ff").context("invalid prompt focus ring color")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PromptUiConfig {
+    locale: String,
+    ui_scale: f32,
+    high_contrast: bool,
+}
+
+impl PromptUiConfig {
+    fn from_env() -> Self {
+        let locale = std::env::var("GARCARD_LOCALE")
+            .or_else(|_| std::env::var("LANG"))
+            .unwrap_or_else(|_| "en_US.UTF-8".to_string());
+        let ui_scale = prompt_scale_from_env(std::env::var("GARCARD_PROMPT_SCALE").ok().as_deref());
+        let high_contrast = parse_bool_env(
+            std::env::var("GARCARD_PROMPT_HIGH_CONTRAST")
+                .ok()
+                .as_deref(),
+        );
+        Self {
+            locale,
+            ui_scale,
+            high_contrast,
+        }
+    }
+}
+
+fn locale_bucket(locale: &str) -> &'static str {
+    let normalized = locale.trim().to_ascii_lowercase();
+    if normalized.starts_with("es") {
+        "es"
+    } else {
+        "en"
+    }
+}
+
+fn prompt_scale_from_env(raw: Option<&str>) -> f32 {
+    let parsed = raw
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .unwrap_or(DEFAULT_UI_SCALE);
+    parsed.clamp(MIN_UI_SCALE, MAX_UI_SCALE)
+}
+
+fn parse_bool_env(raw: Option<&str>) -> bool {
+    match raw.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value)
+            if value == "1"
+                || value == "true"
+                || value == "yes"
+                || value == "on"
+                || value == "enabled" =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptMode {
@@ -53,6 +191,9 @@ struct PromptDialog {
     renderer: Renderer,
     gc: u32,
     keymap: Option<X11Keymap>,
+    strings: PromptStrings,
+    ui_scale: f32,
+    card_padding: i32,
     request: PromptRequest,
     input: String,
     cursor: usize,
@@ -65,6 +206,7 @@ struct PromptDialog {
     accent: Color,
     success: Color,
     error: Color,
+    focus_ring: Color,
     error_blink_on: bool,
     last_blink_toggle: Instant,
     error_flash_until: Option<Instant>,
@@ -157,23 +299,27 @@ impl PromptSession {
             tone: PromptTone::Default,
             feedback_only: false,
         };
+        let ui = PromptUiConfig::from_env();
+        let strings = PromptStrings::for_locale(&ui.locale);
+        let dialog_width = ((BASE_DIALOG_WIDTH as f32) * ui.ui_scale).round() as u32;
+        let dialog_height = ((BASE_DIALOG_HEIGHT as f32) * ui.ui_scale).round() as u32;
 
         let conn = Connection::connect(None).context("failed to connect to X11 display")?;
-        let (x, y) = centered_position(&conn, DIALOG_WIDTH, DIALOG_HEIGHT);
+        let (x, y) = centered_position(&conn, dialog_width, dialog_height);
         let window = Window::create(
             conn.clone(),
             WindowConfig::dialog()
-                .title("garcard authentication")
+                .title(strings.title_auth_required)
                 .class("garcard")
                 .position(x, y)
-                .size(DIALOG_WIDTH, DIALOG_HEIGHT)
+                .size(dialog_width, dialog_height)
                 .transparent(true)
                 .modal(true),
         )
         .context("failed to create prompt window")?;
         window.focus().context("failed to focus prompt window")?;
 
-        let dialog = PromptDialog::new(window, request)?;
+        let dialog = PromptDialog::new(window, request, &ui)?;
         Ok(Self { dialog })
     }
 
@@ -292,17 +438,15 @@ fn centered_position(conn: &Connection, width: u32, height: u32) -> (i32, i32) {
 }
 
 impl PromptDialog {
-    fn new(window: Window, request: PromptRequest) -> Result<Self> {
+    fn new(window: Window, request: PromptRequest, ui: &PromptUiConfig) -> Result<Self> {
         let mut theme = Theme::dark();
-        theme.font_family = "Sans".to_string();
-        theme.font_size = 14.0;
-        let backdrop = Color::from_hex("#0a0b10").context("invalid prompt backdrop color")?;
-        let card_background =
-            Color::from_hex("#111318").context("invalid prompt card background color")?;
-        let card_border = Color::from_hex("#2c3442").context("invalid prompt card border color")?;
-        let accent = Color::from_hex("#8ab4f8").context("invalid prompt accent color")?;
-        let success = Color::from_hex("#41c87a").context("invalid prompt success color")?;
-        let error = Color::from_hex("#ff5f6d").context("invalid prompt error color")?;
+        theme.font_family = std::env::var("GARCARD_PROMPT_FONT_FAMILY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "Noto Sans".to_string());
+        theme.font_size = (14.0_f64 * ui.ui_scale as f64).max(12.0);
+        let palette = PromptPalette::from_high_contrast(ui.high_contrast)?;
+        let strings = PromptStrings::for_locale(&ui.locale);
         let size = window.size();
         let renderer = Renderer::with_theme(size.width, size.height, theme)?;
 
@@ -333,22 +477,42 @@ impl PromptDialog {
             renderer,
             gc,
             keymap,
+            strings,
+            ui_scale: ui.ui_scale,
+            card_padding: ((BASE_CARD_PADDING as f32) * ui.ui_scale).round().max(12.0) as i32,
             request,
             input: String::new(),
             cursor: 0,
             exit: None,
             deadline,
             remaining_secs: None,
-            backdrop,
-            card_background,
-            card_border,
-            accent,
-            success,
-            error,
+            backdrop: palette.backdrop,
+            card_background: palette.card_background,
+            card_border: palette.card_border,
+            accent: palette.accent,
+            success: palette.success,
+            error: palette.error,
+            focus_ring: palette.focus_ring,
             error_blink_on: true,
             last_blink_toggle: Instant::now(),
             error_flash_until: None,
         })
+    }
+
+    fn scaled_i32(&self, value: i32) -> i32 {
+        ((value as f32) * self.ui_scale).round() as i32
+    }
+
+    fn scaled_u32(&self, value: u32) -> u32 {
+        ((value as f32) * self.ui_scale).round().max(1.0) as u32
+    }
+
+    fn scaled_f64(&self, value: f64) -> f64 {
+        value * self.ui_scale as f64
+    }
+
+    fn timeout_text(&self, remaining_secs: u64) -> String {
+        format!("{} {}s", self.strings.timeout_label, remaining_secs)
     }
 
     fn refresh_timeout(&mut self) -> bool {
@@ -467,6 +631,16 @@ impl PromptDialog {
         let width = size.width as i32;
         let height = size.height as i32;
         let theme = self.renderer.theme().clone();
+        let pad = self.card_padding;
+        let body_inset = self.scaled_i32(16);
+        let title_top = self.scaled_i32(14);
+        let message_top = self.scaled_i32(46);
+        let label_top = self.scaled_i32(108);
+        let input_top = self.scaled_i32(126);
+        let input_height = self.scaled_u32(40);
+        let input_inner_x = self.scaled_i32(10);
+        let input_inner_y = self.scaled_i32(12);
+        let footer_top_offset = self.scaled_i32(26);
         let accent = match self.request.tone {
             PromptTone::Default => self.accent,
             PromptTone::Success => self.success,
@@ -482,74 +656,97 @@ impl PromptDialog {
         self.renderer.clear_color(self.backdrop)?;
 
         let card_rect = Rect::new(
-            CARD_PADDING,
-            CARD_PADDING,
-            (width - CARD_PADDING * 2) as u32,
-            (height - CARD_PADDING * 2) as u32,
+            pad,
+            pad,
+            (width - pad * 2) as u32,
+            (height - pad * 2) as u32,
         );
         self.renderer
-            .fill_rounded_rect(card_rect, 12.0, self.card_background)?;
-        self.renderer
-            .stroke_rounded_rect(card_rect, 12.0, self.card_border, 2.0)?;
+            .fill_rounded_rect(card_rect, self.scaled_f64(12.0), self.card_background)?;
+        self.renderer.stroke_rounded_rect(
+            card_rect,
+            self.scaled_f64(12.0),
+            self.card_border,
+            self.scaled_f64(2.0),
+        )?;
 
         let title_style = TextStyle::new()
             .font_family(theme.font_family.clone())
-            .font_size(18.0)
+            .font_size(self.scaled_f64(18.0))
             .color(theme.foreground);
         self.renderer.text(
-            "Authentication Required",
-            (CARD_PADDING + 16) as f64,
-            (CARD_PADDING + 14) as f64,
+            self.strings.title_auth_required,
+            (pad + body_inset) as f64,
+            (pad + title_top) as f64,
             &title_style,
         )?;
 
         let message_style = TextStyle::new()
             .font_family(theme.font_family.clone())
-            .font_size(13.0)
+            .font_size(self.scaled_f64(13.0))
             .color(theme.item_description)
-            .max_width(card_rect.width as i32 - 32)
+            .max_width(card_rect.width as i32 - body_inset * 2)
             .wrap(true)
             .ellipsize(true);
         self.renderer.text(
             &self.request.message,
-            (CARD_PADDING + 16) as f64,
-            (CARD_PADDING + 46) as f64,
+            (pad + body_inset) as f64,
+            (pad + message_top) as f64,
             &message_style,
         )?;
 
         let input_label = match self.request.mode {
-            PromptMode::Secret => "Password",
-            PromptMode::Plain => "Response",
+            PromptMode::Secret => self.strings.label_password,
+            PromptMode::Plain => self.strings.label_response,
         };
         let label_style = TextStyle::new()
             .font_family(theme.font_family.clone())
-            .font_size(12.0)
+            .font_size(self.scaled_f64(12.0))
             .color(theme.input_placeholder);
         self.renderer.text(
             input_label,
-            (CARD_PADDING + 16) as f64,
-            (CARD_PADDING + 108) as f64,
+            (pad + body_inset) as f64,
+            (pad + label_top) as f64,
             &label_style,
         )?;
 
         let input_rect = Rect::new(
-            CARD_PADDING + 16,
-            CARD_PADDING + 126,
-            (width - (CARD_PADDING + 16) * 2) as u32,
-            40,
+            pad + body_inset,
+            pad + input_top,
+            (width - (pad + body_inset) * 2) as u32,
+            input_height,
         );
-        self.renderer
-            .fill_rounded_rect(input_rect, 8.0, theme.input_background)?;
-        self.renderer
-            .stroke_rounded_rect(input_rect, 8.0, accent.with_alpha(0.7), 1.5)?;
+        let focus_rect = Rect::new(
+            input_rect.x - self.scaled_i32(2),
+            input_rect.y - self.scaled_i32(2),
+            input_rect.width + self.scaled_u32(4),
+            input_rect.height + self.scaled_u32(4),
+        );
+        self.renderer.stroke_rounded_rect(
+            focus_rect,
+            self.scaled_f64(10.0),
+            self.focus_ring.with_alpha(0.75),
+            self.scaled_f64(1.2),
+        )?;
+        self.renderer.fill_rounded_rect(
+            input_rect,
+            self.scaled_f64(8.0),
+            theme.input_background,
+        )?;
+        self.renderer.stroke_rounded_rect(
+            input_rect,
+            self.scaled_f64(8.0),
+            accent.with_alpha(0.85),
+            self.scaled_f64(1.5),
+        )?;
 
         let display_input = display_value(&self.input, self.request.mode);
         let input_style = TextStyle::new()
             .font_family(theme.font_family.clone())
-            .font_size(14.0)
+            .font_size(self.scaled_f64(14.0))
             .color(theme.input_foreground);
-        let input_y = input_rect.y + 12;
-        let input_x = input_rect.x + 10;
+        let input_y = input_rect.y + input_inner_y;
+        let input_x = input_rect.x + input_inner_x;
         self.renderer
             .text(&display_input, input_x as f64, input_y as f64, &input_style)?;
 
@@ -558,38 +755,43 @@ impl PromptDialog {
             let cursor_size = self.renderer.measure_text(&cursor_prefix, &input_style)?;
             let cursor_x = input_x + cursor_size.width as i32;
             self.renderer.fill_rect(
-                Rect::new(cursor_x, input_rect.y + 8, 2, input_rect.height - 16),
+                Rect::new(
+                    cursor_x,
+                    input_rect.y + self.scaled_i32(8),
+                    self.scaled_u32(2),
+                    input_rect.height.saturating_sub(self.scaled_u32(16)),
+                ),
                 accent,
             )?;
         }
 
         let footer_style = TextStyle::new()
-            .font_family(theme.font_family)
-            .font_size(12.0)
+            .font_family(theme.font_family.clone())
+            .font_size(self.scaled_f64(12.0))
             .color(theme.item_description);
         let footer_text = if self.request.feedback_only {
-            "Please wait"
+            self.strings.footer_wait
         } else {
-            "Enter submit   Esc cancel"
+            self.strings.footer_controls
         };
         self.renderer.text(
             footer_text,
-            (CARD_PADDING + 16) as f64,
-            (height - CARD_PADDING - 26) as f64,
+            (pad + body_inset) as f64,
+            (height - pad - footer_top_offset) as f64,
             &footer_style,
         )?;
 
         if let Some(remaining) = self.remaining_secs {
-            let timer_text = format!("timeout {}s", remaining);
+            let timer_text = self.timeout_text(remaining);
             let timer_style = TextStyle::new()
-                .font_family("Sans")
-                .font_size(12.0)
+                .font_family(theme.font_family.clone())
+                .font_size(self.scaled_f64(12.0))
                 .color(accent);
             let timer_size = self.renderer.measure_text(&timer_text, &timer_style)?;
             self.renderer.text(
                 &timer_text,
-                (width - CARD_PADDING - timer_size.width as i32 - 16) as f64,
-                (height - CARD_PADDING - 26) as f64,
+                (width - pad - timer_size.width as i32 - body_inset) as f64,
+                (height - pad - footer_top_offset) as f64,
                 &timer_style,
             )?;
         }
@@ -711,5 +913,40 @@ mod tests {
         assert_eq!(keysym_to_char('A' as u32), Some('A'));
         assert_eq!(keysym_to_char(0x0100_03B1), Some('α'));
         assert_eq!(keysym_to_char(0), None);
+    }
+
+    #[test]
+    fn locale_bucket_supports_spanish_and_defaults_to_english() {
+        assert_eq!(locale_bucket("es_ES.UTF-8"), "es");
+        assert_eq!(locale_bucket("en_US.UTF-8"), "en");
+        assert_eq!(locale_bucket("C"), "en");
+    }
+
+    #[test]
+    fn prompt_scale_from_env_clamps_range() {
+        assert_eq!(prompt_scale_from_env(Some("0.2")), MIN_UI_SCALE);
+        assert_eq!(prompt_scale_from_env(Some("1.5")), 1.5);
+        assert_eq!(prompt_scale_from_env(Some("9.9")), MAX_UI_SCALE);
+        assert_eq!(prompt_scale_from_env(None), DEFAULT_UI_SCALE);
+    }
+
+    #[test]
+    fn parse_bool_env_accepts_common_truthy_values() {
+        assert!(parse_bool_env(Some("1")));
+        assert!(parse_bool_env(Some("TRUE")));
+        assert!(parse_bool_env(Some("enabled")));
+        assert!(!parse_bool_env(Some("0")));
+        assert!(!parse_bool_env(None));
+    }
+
+    #[test]
+    fn prompt_strings_localize_known_labels() {
+        let english = PromptStrings::for_locale("en_US.UTF-8");
+        assert_eq!(english.title_auth_required, "Authentication Required");
+        assert_eq!(english.footer_controls, "Enter submit   Esc cancel");
+
+        let spanish = PromptStrings::for_locale("es_ES.UTF-8");
+        assert_eq!(spanish.label_password, "Contrasena");
+        assert_eq!(spanish.footer_wait, "Espere");
     }
 }
