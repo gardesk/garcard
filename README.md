@@ -64,6 +64,7 @@ gartk prompt path with a persistent in-process modal session and falls back to
 11. `examples/validate-sprint-08-parity.sh`
 12. `examples/sprint-08-integration-certification.md`
 13. `examples/validate-sprint-08-integration.sh`
+14. `examples/sprint-08-validation-report-2026-02-26.md`
 
 ## Troubleshooting
 1. `Authorization requires authentication but no agent is available`
