@@ -21,6 +21,7 @@ pub enum Command {
     Status,
     Version,
     AuthSummary,
+    TempList,
     Quit,
 }
 

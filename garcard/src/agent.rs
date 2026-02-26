@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 use zbus::blocking::{Connection, Proxy};
 use zbus::fdo;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Str};
@@ -56,6 +57,15 @@ pub struct PolkitBackendConfig {
 type Subject = (String, HashMap<String, OwnedValue>);
 type Details = HashMap<String, String>;
 type TemporaryAuthorization = (String, String, Subject, u64, u64);
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TemporaryAuthorizationRecord {
+    pub authorization_id: String,
+    pub action_id: String,
+    pub obtained_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub expires_in_secs: u64,
+}
 const DEFAULT_AUTH_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_IDENTITY_SELECTION_ATTEMPTS: usize = 3;
 const DEFAULT_RETENTION_SELECTION_ATTEMPTS: usize = 3;
@@ -657,6 +667,33 @@ fn helper_outcome_label(outcome: HelperOutcome) -> &'static str {
         HelperOutcome::Canceled => "canceled",
         HelperOutcome::Timeout => "timeout",
     }
+}
+
+pub fn enumerate_temporary_authorizations() -> Result<Vec<TemporaryAuthorizationRecord>> {
+    let connection = Connection::system().context("failed to connect to system bus")?;
+    let subject = build_subject();
+    let proxy = PolkitAgent::proxy(&connection)?;
+    let authorizations: Vec<TemporaryAuthorization> =
+        proxy.call("EnumerateTemporaryAuthorizations", &subject)?;
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+
+    let mut entries = Vec::with_capacity(authorizations.len());
+    for (authorization_id, action_id, _subject, obtained_at_unix, expires_at_unix) in authorizations
+    {
+        let expires_in_secs = expires_at_unix.saturating_sub(now_unix);
+        entries.push(TemporaryAuthorizationRecord {
+            authorization_id,
+            action_id,
+            obtained_at_unix,
+            expires_at_unix,
+            expires_in_secs,
+        });
+    }
+    entries.sort_by(|left, right| left.action_id.cmp(&right.action_id));
+    Ok(entries)
 }
 
 fn revoke_temporary_authorizations_for_action(action_id: &str) -> Result<usize> {

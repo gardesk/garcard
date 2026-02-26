@@ -17,6 +17,7 @@ enum Commands {
     Status,
     Version,
     AuthSummary,
+    TempList,
     Quit,
 }
 
@@ -47,6 +48,7 @@ fn to_protocol_command(command: Commands) -> Command {
         Commands::Status => Command::Status,
         Commands::Version => Command::Version,
         Commands::AuthSummary => Command::AuthSummary,
+        Commands::TempList => Command::TempList,
         Commands::Quit => Command::Quit,
     }
 }

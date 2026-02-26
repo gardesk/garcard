@@ -1,4 +1,7 @@
-use crate::agent::{AuthAgentBackend, PolkitAgent, PolkitBackendConfig, StubPolkitAgent};
+use crate::agent::{
+    AuthAgentBackend, PolkitAgent, PolkitBackendConfig, StubPolkitAgent,
+    enumerate_temporary_authorizations,
+};
 use crate::config::{AgentBackendMode, Config};
 use crate::state::{AuthState, RuntimeState};
 use anyhow::{Context, Result};
@@ -286,6 +289,15 @@ fn dispatch(
         Command::Status => Response::ok_with_data(state.status()),
         Command::Version => Response::ok_with_data(state.version()),
         Command::AuthSummary => Response::ok_with_data(state.auth_summary()),
+        Command::TempList => match enumerate_temporary_authorizations() {
+            Ok(authorizations) => {
+                Response::ok_with_data(json!({ "authorizations": authorizations }))
+            }
+            Err(err) => Response::err(format!(
+                "failed to enumerate temporary authorizations: {}",
+                err
+            )),
+        },
         Command::Quit => {
             if shutdown_tx.send(()).is_err() {
                 Response::err("daemon shutdown channel unavailable")
