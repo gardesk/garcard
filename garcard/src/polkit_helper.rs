@@ -10,6 +10,7 @@ use std::time::Duration;
 pub const DEFAULT_HELPER_SOCKET: &str = "/run/polkit/agent-helper.socket";
 const HELPER_TRANSPORT_ENV: &str = "GARCARD_POLKIT_HELPER_TRANSPORT";
 const HELPER_SOCKET_PROTOCOL_ENV: &str = "GARCARD_POLKIT_SOCKET_PROTOCOL";
+const HELPER_CONVERSATION_BACKEND_ENV: &str = "GARCARD_POLKIT_CONVERSATION_BACKEND";
 const SOCKET_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +91,28 @@ impl HelperSocketClient {
         cookie: &str,
         prompts: &mut P,
     ) -> Result<HelperOutcome> {
+        let conversation_backend = helper_conversation_backend();
+        tracing::debug!(
+            backend = %conversation_backend.as_str(),
+            env_key = HELPER_CONVERSATION_BACKEND_ENV,
+            "Selected polkit helper conversation backend"
+        );
+        match conversation_backend {
+            HelperConversationBackend::Auto | HelperConversationBackend::HelperProtocol => {
+                self.authenticate_with_helper_protocol(username, cookie, prompts)
+            }
+            HelperConversationBackend::SessionApi => {
+                self.authenticate_via_session_api(username, cookie, prompts)
+            }
+        }
+    }
+
+    fn authenticate_with_helper_protocol<P: PromptProvider>(
+        &self,
+        username: &str,
+        cookie: &str,
+        prompts: &mut P,
+    ) -> Result<HelperOutcome> {
         let username_line = sanitize_control_line(username);
         let cookie_line = sanitize_control_line(cookie);
         let transport = helper_transport_mode();
@@ -134,6 +157,15 @@ impl HelperSocketClient {
                 }
             }
         }
+    }
+
+    fn authenticate_via_session_api<P: PromptProvider>(
+        &self,
+        _username: &str,
+        _cookie: &str,
+        _prompts: &mut P,
+    ) -> Result<HelperOutcome> {
+        anyhow::bail!("session-api helper conversation backend is not yet implemented");
     }
 
     fn authenticate_auto_transport<P: PromptProvider>(
@@ -684,6 +716,23 @@ impl HelperSocketProtocol {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelperConversationBackend {
+    Auto,
+    HelperProtocol,
+    SessionApi,
+}
+
+impl HelperConversationBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::HelperProtocol => "helper-protocol",
+            Self::SessionApi => "session-api",
+        }
+    }
+}
+
 fn helper_transport_mode() -> HelperTransportMode {
     match std::env::var(HELPER_TRANSPORT_ENV)
         .ok()
@@ -708,6 +757,27 @@ fn helper_socket_protocol() -> HelperSocketProtocol {
             HelperSocketProtocol::UsernameCookie
         }
         _ => HelperSocketProtocol::Auto,
+    }
+}
+
+fn helper_conversation_backend() -> HelperConversationBackend {
+    let raw = std::env::var(HELPER_CONVERSATION_BACKEND_ENV).ok();
+    parse_helper_conversation_backend(raw.as_deref())
+}
+
+fn parse_helper_conversation_backend(raw: Option<&str>) -> HelperConversationBackend {
+    match raw
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("helper")
+        | Some("helper-protocol")
+        | Some("helper_protocol")
+        | Some("helperprotocol") => HelperConversationBackend::HelperProtocol,
+        Some("session") | Some("session-api") | Some("session_api") | Some("sessionapi") => {
+            HelperConversationBackend::SessionApi
+        }
+        _ => HelperConversationBackend::Auto,
     }
 }
 
@@ -901,6 +971,47 @@ mod tests {
         assert_eq!(
             parse_helper_line("polkit-agent-helper-1: informational message").expect("maps info"),
             HelperEvent::Info("polkit-agent-helper-1: informational message".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_helper_conversation_backend_values() {
+        assert_eq!(
+            parse_helper_conversation_backend(Some("helper")),
+            HelperConversationBackend::HelperProtocol
+        );
+        assert_eq!(
+            parse_helper_conversation_backend(Some("helper-protocol")),
+            HelperConversationBackend::HelperProtocol
+        );
+        assert_eq!(
+            parse_helper_conversation_backend(Some("session")),
+            HelperConversationBackend::SessionApi
+        );
+        assert_eq!(
+            parse_helper_conversation_backend(Some("session-api")),
+            HelperConversationBackend::SessionApi
+        );
+        assert_eq!(
+            parse_helper_conversation_backend(Some("something-else")),
+            HelperConversationBackend::Auto
+        );
+        assert_eq!(
+            parse_helper_conversation_backend(None),
+            HelperConversationBackend::Auto
+        );
+    }
+
+    #[test]
+    fn session_backend_reports_not_implemented() {
+        let client = HelperSocketClient::new(temp_socket_path());
+        let mut prompts = FakePrompt::default();
+        let err = client
+            .authenticate_via_session_api("alice", "cookie-session", &mut prompts)
+            .expect_err("session backend should be unimplemented");
+        assert!(
+            err.to_string()
+                .contains("session-api helper conversation backend is not yet implemented")
         );
     }
 
