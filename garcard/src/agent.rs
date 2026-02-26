@@ -57,6 +57,18 @@ pub struct PolkitBackendConfig {
 type Subject = (String, HashMap<String, OwnedValue>);
 type Details = HashMap<String, String>;
 type TemporaryAuthorization = (String, String, Subject, u64, u64);
+type ActionDescription = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    u32,
+    u32,
+    u32,
+    Details,
+);
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TemporaryAuthorizationRecord {
@@ -396,7 +408,8 @@ impl PolkitRuntime {
         {
             identity_options.insert(0, username.clone());
         }
-        let retention_options = retention_options_from_details(&request.details);
+        let retention_options =
+            retention_options_with_policy_fallback(&request.action_id, &request.details);
 
         tracing::debug!(
             identity_summary = %summarize_identities(&request.identities),
@@ -1187,6 +1200,61 @@ fn retention_options_from_details(details: &Details) -> Vec<RetentionPolicy> {
 
     options.push(RetentionPolicy::Session);
     options
+}
+
+fn retention_options_with_policy_fallback(
+    action_id: &str,
+    details: &Details,
+) -> Vec<RetentionPolicy> {
+    let options = retention_options_from_details(details);
+    if options.len() > 1 {
+        return options;
+    }
+
+    match retention_options_from_action_policy(action_id) {
+        Ok(Some(policy_options)) if policy_options.len() > 1 => policy_options,
+        Ok(_) => options,
+        Err(err) => {
+            tracing::debug!(
+                action_id = %action_id,
+                error = %err,
+                "Unable to infer retention options from polkit action policy"
+            );
+            options
+        }
+    }
+}
+
+fn retention_options_from_action_policy(action_id: &str) -> Result<Option<Vec<RetentionPolicy>>> {
+    let connection = Connection::system().context("failed to connect to system bus")?;
+    let proxy = PolkitAgent::proxy(&connection)?;
+    let actions: Vec<ActionDescription> = proxy.call("EnumerateActions", &"")?;
+    Ok(retention_options_from_action_descriptions(
+        action_id, &actions,
+    ))
+}
+
+fn retention_options_from_action_descriptions(
+    action_id: &str,
+    actions: &[ActionDescription],
+) -> Option<Vec<RetentionPolicy>> {
+    let mut options = vec![RetentionPolicy::OneShot];
+    let (_, _, _, _, _, _, implicit_any, implicit_inactive, implicit_active, _) =
+        actions.iter().find(|(id, ..)| id == action_id)?;
+
+    if implicit_authorization_supports_retention(*implicit_any)
+        || implicit_authorization_supports_retention(*implicit_inactive)
+        || implicit_authorization_supports_retention(*implicit_active)
+    {
+        options.push(RetentionPolicy::Session);
+    }
+
+    Some(options)
+}
+
+fn implicit_authorization_supports_retention(value: u32) -> bool {
+    // 3/4 are *_RETAINED variants in PolkitImplicitAuthorization.
+    value == 3 || value == 4
 }
 
 fn first_detail_value(details: &Details, keys: &[&str]) -> Option<String> {
@@ -2309,6 +2377,47 @@ mod tests {
                 RetentionPolicy::Always
             ]
         );
+    }
+
+    #[test]
+    fn retention_options_from_action_descriptions_support_retained_policies() {
+        let actions = vec![(
+            "com.gardesk.test".to_string(),
+            "desc".to_string(),
+            "msg".to_string(),
+            "vendor".to_string(),
+            "url".to_string(),
+            "icon".to_string(),
+            0_u32,
+            0_u32,
+            4_u32,
+            HashMap::new(),
+        )];
+
+        let options = retention_options_from_action_descriptions("com.gardesk.test", &actions)
+            .expect("action should resolve");
+        assert_eq!(
+            options,
+            vec![RetentionPolicy::OneShot, RetentionPolicy::Session]
+        );
+    }
+
+    #[test]
+    fn retention_options_from_action_descriptions_handle_missing_action() {
+        let actions = vec![(
+            "com.gardesk.other".to_string(),
+            "desc".to_string(),
+            "msg".to_string(),
+            "vendor".to_string(),
+            "url".to_string(),
+            "icon".to_string(),
+            0_u32,
+            0_u32,
+            0_u32,
+            HashMap::new(),
+        )];
+
+        assert!(retention_options_from_action_descriptions("com.gardesk.test", &actions).is_none());
     }
 
     #[test]
