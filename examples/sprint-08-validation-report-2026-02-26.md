@@ -22,17 +22,27 @@
    - previous `InvalidArgs` (`(sa{sv})` vs `((sa{sv}))`) no longer appears
    - `temp-list` and `temp-revoke-all` return clean baseline results
 4. Workspace tests pass after lifecycle-call marshaling fix.
+5. Interactive parity loop executed via `GARCARD_SPRINT08_RUN_INTERACTIVE=1 ./examples/validate-sprint-08-parity.sh`:
+   - successful auth path observed (`last_outcome: success`)
+   - canceled auth path observed (`last_outcome: canceled`)
+   - temporary authorizations created and revoked in-loop (`revoked_count: 1`)
+6. Privileged polkit-restart recovery executed manually on 2026-02-26:
+   - operator ran `sudo systemctl restart polkit`
+   - post-restart lifecycle verification on `polkit` backend passed (`validate-sprint-07.sh`)
 
 ## Matrix Status
 1. Baseline non-interactive rows updated in `examples/sprint-08-parity-matrix.md`.
-2. Remaining rows are interactive/policy-dependent and still pending:
-   - success/failure/cancel/timeout prompt-path parity via `pkcheck`
+2. Interactive/passive coverage now includes:
+   - success and canceled prompt paths
+   - temp-list and temp-revoke-all with concrete temporary authorization ids
+   - manual privileged polkit-restart recovery
+3. Remaining rows are policy/path specific and still pending:
+   - explicit wrong-password failure path (`last_outcome: failure`)
+   - timeout path under live challenge (`last_outcome: timeout`)
    - multi-identity and retention-choice scenarios
-   - privileged polkit restart recovery path
+   - temp-revoke single-id scenario
 
 ## Next Actions
-1. Run interactive parity pass:
-   - `GARCARD_SPRINT08_RUN_INTERACTIVE=1 ./examples/validate-sprint-08-parity.sh`
-2. Execute privileged recovery check:
-   - `GARCARD_SPRINT07_POLKIT_RESTART_CMD='sudo systemctl restart polkit' ./examples/validate-sprint-07.sh`
-3. Mark remaining matrix rows PASS/FAIL with log pointers.
+1. Run one focused wrong-password parity capture (`failure` outcome) with debug logs.
+2. Run one focused timeout capture using short prompt timeout on `polkit` backend.
+3. Add one targeted single-id revoke capture (`temp-revoke <authorization-id>`) and finalize matrix signoff.
