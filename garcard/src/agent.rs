@@ -495,6 +495,8 @@ impl PolkitRuntime {
             .map_err(|_| anyhow::anyhow!("auth outcome map lock poisoned"))?;
         loop {
             if let Some(outcome) = outcomes.remove(cookie) {
+                drop(outcomes);
+                self.clear_canceled(cookie);
                 return Ok(outcome);
             }
             outcomes = self
@@ -1223,6 +1225,43 @@ mod tests {
     }
 
     #[test]
+    fn runtime_wait_for_completion_clears_canceled_marker() {
+        let auth_state = Arc::new(AuthState::default());
+        let runtime = Arc::new(PolkitRuntime::new_without_worker(Arc::clone(&auth_state)));
+        runtime.mark_canceled("cookie-1");
+        runtime.record_outcome("cookie-1", HelperOutcome::Canceled);
+        assert!(runtime.is_canceled("cookie-1"));
+
+        let outcome = runtime
+            .wait_for_completion("cookie-1")
+            .expect("wait for completion");
+        assert_eq!(outcome, HelperOutcome::Canceled);
+        assert!(!runtime.is_canceled("cookie-1"));
+    }
+
+    #[test]
+    fn runtime_complete_request_promotes_next_request_and_records_outcome() {
+        let auth_state = Arc::new(AuthState::default());
+        let runtime = Arc::new(PolkitRuntime::new_without_worker(Arc::clone(&auth_state)));
+        runtime
+            .begin_authentication(fake_request("cookie-1"))
+            .expect("begin first");
+        runtime
+            .begin_authentication(fake_request("cookie-2"))
+            .expect("begin second");
+
+        runtime.complete_request("cookie-1", HelperOutcome::Denied);
+
+        let outcome = runtime
+            .wait_for_completion("cookie-1")
+            .expect("wait for completion");
+        assert_eq!(outcome, HelperOutcome::Denied);
+        assert_eq!(auth_state.summary().state, "pending_prompt");
+        assert_eq!(auth_state.summary().active_requests, 1);
+        assert_eq!(auth_state.summary().queued_requests, 0);
+    }
+
+    #[test]
     fn authenticate_active_request_retries_after_failure_then_succeeds() {
         let socket_path = temp_socket_path();
         let listener = UnixListener::bind(&socket_path).expect("bind test socket");
@@ -1288,6 +1327,60 @@ mod tests {
         assert_eq!(prompts.prompt_count, 2);
         assert_eq!(prompts.success_count, 1);
         assert_eq!(prompts.failure_messages, vec!["Authentication failed"]);
+
+        server.join().expect("server join");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn authenticate_active_request_returns_timeout_when_prompt_times_out() {
+        let socket_path = temp_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let read_stream = stream.try_clone().expect("clone");
+            let mut reader = BufReader::new(read_stream);
+
+            let mut first_line = String::new();
+            reader.read_line(&mut first_line).expect("read first line");
+            if first_line.trim() == "alice" {
+                let mut cookie = String::new();
+                reader.read_line(&mut cookie).expect("read cookie");
+            }
+
+            stream
+                .write_all(b"PAM_PROMPT_ECHO_OFF Password:\n")
+                .expect("write prompt");
+            stream.flush().expect("flush prompt");
+        });
+
+        let runtime = PolkitRuntime {
+            auth_state: Arc::new(AuthState::default()),
+            queue: Mutex::new(AuthQueue::default()),
+            outcomes: Mutex::new(HashMap::new()),
+            canceled_cookies: Mutex::new(HashSet::new()),
+            outcome_signal: Condvar::new(),
+            helper_client: HelperSocketClient::new(&socket_path),
+            processing: AtomicBool::new(false),
+            worker_enabled: false,
+        };
+        let active = ActiveRequest {
+            action_id: "org.gardesk.test".to_string(),
+            message: "Authenticate".to_string(),
+            icon_name: "dialog-password".to_string(),
+            detail_count: 0,
+            details: HashMap::new(),
+            cookie: "cookie-timeout".to_string(),
+            username: "alice".to_string(),
+        };
+        let mut prompts = SequencedPrompt::new(vec![PromptResponse::TimedOut]);
+
+        let outcome = runtime.authenticate_active_request_with_prompts(&active, &mut prompts);
+        assert_eq!(outcome, HelperOutcome::Timeout);
+        assert_eq!(prompts.prompt_count, 1);
+        assert_eq!(prompts.success_count, 0);
+        assert!(prompts.failure_messages.is_empty());
 
         server.join().expect("server join");
         let _ = std::fs::remove_file(&socket_path);
