@@ -2,8 +2,7 @@ use anyhow::{Context, Result};
 use gartk_core::{Color, InputEvent, Key, KeyEvent, Rect, Theme};
 use gartk_render::{Renderer, TextStyle, copy_surface_to_window};
 use gartk_x11::{
-    Connection, EventLoop, EventLoopConfig, Window, WindowConfig, monitor_at_pointer,
-    primary_monitor,
+    Connection, EventLoop, EventLoopConfig, Window, WindowConfig, monitor_of_active_window,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -559,9 +558,7 @@ impl PromptDialog {
 }
 
 fn centered_position(conn: &Connection, width: u32, height: u32) -> (i32, i32) {
-    let monitor = monitor_at_pointer(conn)
-        .or_else(|_| primary_monitor(conn))
-        .ok();
+    let monitor = monitor_of_active_window(conn).ok();
     if let Some(monitor) = monitor {
         let x = monitor.rect.x + (monitor.rect.width as i32 - width as i32) / 2;
         let y = monitor.rect.y + (monitor.rect.height as i32 - height as i32) / 3;
